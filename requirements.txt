@@ -1,0 +1,11 @@
+cvxpy==1.6.3
+cvxpylayers==0.1.9
+matplotlib==3.10.1
+numpy==1.25.2
+scikit-learn==1.6.1
+scipy==1.15.2
+seaborn==0.13.2
+torch==2.6.0
+torchvision==0.21.0
+tqdm==4.67.1
+psutil==7.0.0

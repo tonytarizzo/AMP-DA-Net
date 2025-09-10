@@ -1,0 +1,2 @@
+
+from .global_model_update import update_model_inplace
