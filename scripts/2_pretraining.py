@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 from src.codebooks import (
@@ -46,9 +45,6 @@ from src.utils import (
 )
 from src.analysis import (
     pi_from_indices,
-    m2_from_indices,
-    m2_true_from_pi,
-    plot_estimation_diagnostics,
     plot_pretraining,
     plot_parameter_traces,
     analyse_codebook,
@@ -56,7 +52,9 @@ from src.analysis import (
     save_json,
     append_jsonl,
     run_manifest,
+    _sha1_tensor,
     _triplet_to_dict,
+    save_codebook_analysis_artifacts,
 )
 
 
@@ -67,22 +65,20 @@ class BlockMeta:
     local_end: int
     global_start: int
     global_end: int
-    round_len: int  # optional, but handy for checks
-    sel_global: list[int] | None = None # NEW
+    round_len: int
+    sel_global: list[int] | None = None
 
     @property
     def block_len(self) -> int:
         return self.local_end - self.local_start
     
+
 def split_round_ids(R, args):
     g = torch.Generator().manual_seed(args.seed)
     perm = torch.randperm(R, generator=g).tolist()
-
     n_test = min(max(int(args.num_test_rounds), 0), max(R - 1, 0))
     test_round_ids = perm[:n_test]
     remaining_rounds = [r for r in range(R) if r not in test_round_ids]
-
-    # (Optional) make valid disjoint from train: take ~10% of remaining for valid
     n_valid_rounds = max(1, min(len(remaining_rounds)-1, int(0.10 * len(remaining_rounds)))) if len(remaining_rounds) > 1 else 0
     valid_round_ids = remaining_rounds[:n_valid_rounds]
     train_round_ids = remaining_rounds[n_valid_rounds:] if n_valid_rounds > 0 else remaining_rounds
@@ -158,7 +154,6 @@ def build_split(
     total_batches = 0
     local_cursor = 0
 
-    # normalize mode, NEW
     mode = str(within_round).lower()
     if mode not in {"prefix","contig_rand","random"}:
         raise ValueError(f"within_round must be one of ['prefix','contig_rand','random'], got {within_round!r}")
@@ -223,31 +218,105 @@ def build_split(
     return X_split, K_vec, blocks_meta
 
 
+def select_block_from_Z_full(blk: BlockMeta, Z_full: torch.Tensor, round_len: int) -> torch.Tensor:
+    """Return the Z slice for a per-round block `blk` from the round-wise Z_full."""
+    r = blk.r_global
+    s_full = r * round_len
+    if getattr(blk, "sel_global", None):
+        offs = torch.tensor(blk.sel_global, device=Z_full.device, dtype=torch.long) - s_full
+        return Z_full.index_select(0, offs)
+    off0 = blk.global_start - s_full
+    off1 = off0 + (blk.global_end - blk.global_start)
+    return Z_full[off0:off1]
+
+
+def save_codebook_analysis_artifacts(metrics, args, *, codebook_pt_path: str | None = None, plot_path: str | None = None, base_name: str = "codebook_analysis"):
+    """
+    Save analysis so plots can be fully recreated:
+      - <save_dir>/summaries/codebook_analysis.json        (scalars + meta)
+      - <save_dir>/summaries/codebook_analysis_arrays.npz  (arrays)
+    """
+    import numpy as np
+    summ_dir = os.path.join(args.save_dir, "summaries")
+    os.makedirs(summ_dir, exist_ok=True)
+
+    # Arrays → NPZ (compressed)
+    arrays = metrics.get("_arrays", {})
+    arrays_to_save = {}
+    for key in ["G", "S", "rip_deltas", "G_hist_counts", "G_hist_edges"]:
+        if key in arrays and arrays[key] is not None:
+            arrays_to_save[key] = np.asarray(arrays[key])
+
+    npz_path = os.path.join(summ_dir, f"{base_name}_arrays.npz")
+    if arrays_to_save:
+        np.savez_compressed(npz_path, **arrays_to_save)
+    else:
+        npz_path = None
+
+    codebook_sha1 = None
+    try:
+        if "decoder_model" in globals():
+            codebook_sha1 = _sha1_tensor(decoder_model.C_syn.data.clone())
+    except Exception:
+        pass
+
+    # JSON (scalars + meta + file references)
+    scalars = metrics.get("_scalars", {})
+    cc_percentiles = metrics.get("_cc_percentiles", {})
+    cfg = metrics.get("_config", {})
+    basic = metrics.get("_basic", {})
+
+    json_payload = {
+        "metric_source": "codebook_analysis",
+        "version": 1,
+        "dimensions": metrics.get("dimensions"),
+        "basic": basic,  # {m, n}
+        "config": cfg,   # {k_rip, num_trials, heatmap_vmax, hist_bins}
+        "scalars": scalars,
+        "cc_percentiles": cc_percentiles,
+        "rip_quality": metrics.get("rip_quality", None),
+
+        # references
+        "files": {
+            "arrays_npz": (None if npz_path is None else os.path.relpath(npz_path, args.save_dir)),
+            "plot_path": (None if plot_path is None else os.path.relpath(plot_path, args.save_dir)),
+            "codebook_pt": (None if not codebook_pt_path else os.path.relpath(codebook_pt_path, args.save_dir)),
+        },
+        "codebook_sha1": codebook_sha1,
+        "context": run_manifest(args),
+    }
+    save_json(json_payload, os.path.join(summ_dir, f"{base_name}.json"))
+
+
 @torch.no_grad()
-def estimate_and_cache_from_full_round(model: "PretrainDecoder", X_all: torch.Tensor, idx_all: torch.Tensor,
-                                       round_id: int, round_len: int, snr_db: float, *, use_counts_pi: bool = True,
-                                       pi_target: torch.Tensor = None, trim: float = 0.0):
-    """
-    1) Grab the full round r from X_all/idx_all.
-    2) Encode once with the the current codebook.
-    3) Build pi estimate from counts (or use supplied target pi).
-    4) Call model.estimate_round(...) to cache K, σ² inside AMPNet.
-    Returns: dict(est=..., pi_round=..., Z_full=...) for logging.
-    """
+def prepare_round(model: "PretrainDecoder",
+                  X_all: torch.Tensor,
+                  idx_all: torch.Tensor,
+                  round_id: int,
+                  round_len: int,
+                  snr_db_signal: float,
+                  *,
+                  use_counts_pi: bool = True,
+                  pi_target: torch.Tensor | None = None,
+                  ):
     s = round_id * round_len
     e = s + round_len
     X_full   = X_all[s:e]
     idx_full = idx_all[s:e]
 
-    Z_full = model.encode_with_noise(X_full, snr_db)
+    # Use stream SNR for generating noisy measurements to be decoded
+    Z_full = model.encode_with_noise(X_full, snr_db_signal)
     if use_counts_pi:
         pi_round = pi_from_indices(idx_full, model.ampnet.n, X_full.device)
     else:
         assert pi_target is not None, "pi_target required when use_counts_pi=False"
         pi_round = pi_target.to(X_full.device).to(torch.float32)
-
-    est = model.estimate_round(Z_full, pi_round, idx_full, trim=trim)
-    return {"est": est, "pi_round": pi_round, "Z_full": Z_full, "idx_full": idx_full}
+    model.ampnet.start_new_round(
+        z_round=Z_full,
+        pi_round=pi_round,
+        external_URA_codebook=model.C_syn,
+    )
+    return {"pi_round": pi_round, "Z_full": Z_full, "idx_full": idx_full}
 
 
 class PretrainDecoder(nn.Module):
@@ -297,50 +366,18 @@ class PretrainDecoder(nn.Module):
         if snr_db is not None:
             z = add_awgn_noise(z, snr_db)
         return z
-
-    @torch.no_grad()
-    def estimate_round(self, Z_round, pi_round, idx_round, trim=0.0):
-        """
-        Estimate K via matched filter along Gram·π, estimate m2 from indices (U-statistic),
-        then cache (K, σ², m2) inside AMPNet for this round.
-        """
-        self.ampnet.update_codebook_cache(self.C_syn, pi_round)
-        C_dn = self.ampnet._cached["C_dn"]
-        gram = self.ampnet._cached["gram"]
-        pi_n = self.ampnet._normalize_pi(pi_round.flatten())
-        g_pi = gram @ pi_n
-        r_bar = (Z_round @ C_dn).mean(dim=0)                           # (n,)
-
-        denom = float((g_pi * g_pi).sum().clamp_min(1e-12).item())
-        K_est = float((r_bar * g_pi).sum().item() / denom)
-        K_est = max(0.0, min(float(self.ampnet.n), K_est))
-
-        m2_hat = m2_from_indices(idx_round, K_est, self.C_syn)
-
-        self.ampnet.start_new_round(
-            z_round=Z_round, pi_round=pi_round, m2_round=m2_hat,
-            external_URA_codebook=self.C_syn, trim=trim
-        )
-
-        d = self.C_syn.shape[1]
-        sig2 = float(self.ampnet._round_params["sigma2"])
-        P_sig = (K_est**2) * m2_hat / float(d)
-        snr_db_est = 10.0 * math.log10(max(1e-12, P_sig) / max(1e-12, sig2))
-
-        return dict(K_est=K_est, K_int=int(round(K_est)), m2_est=m2_hat, sigma2=sig2, snr_db_est=snr_db_est)
     
-    def forward(self, x, snr_db=None, K_a_batch=None, pi=None, use_cached_sigma=False):
+    def forward(self, x, snr_db=None, pi=None, use_cached_sigma=False):
         z = self.encode_with_noise(x, snr_db)
         snr_for_amp = None if use_cached_sigma else snr_db
-        x_est, k_final, K_trace, sigma_trace = self.ampnet(
-            z, external_URA_codebook=self.C_syn, K_round=K_a_batch, pi_round=pi, snr_db=snr_for_amp
-        )
+        x_est, k_final, K_trace, sigma_trace = self.ampnet(z, external_URA_codebook=self.C_syn, pi_round=pi, snr_db=snr_for_amp)
         return z, x_est, k_final, K_trace, sigma_trace
 
 
 def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, valid_blocks,
                       X_all, idx_rounds_all, pi_est_rounds_all, round_len, args):
-    """Pretrain AMP-Net & (optionally) URA codebook on the generated dataset."""
+    """Pretrain AMP-DA-Net & (optionally) URA codebook on the generated dataset."""
+
     # Codebook initialization options (all unit-norm rows)
     init_mode = str(getattr(args, "codebook_init", "q_init")).lower()
     if init_mode == "q_init":
@@ -394,31 +431,22 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
             r_global = blk.r_global
 
             snr_db_r = snr_next_train() 
-            est_pack = estimate_and_cache_from_full_round(
+            prep = prepare_round(
                 model,
                 X_all=X_all,
                 idx_all=idx_rounds_all,
                 round_id=r_global,
                 round_len=round_len,
-                snr_db=snr_db_r,
+                snr_db_signal=snr_db_r,
                 use_counts_pi=False,
-                pi_target=pi_est_rounds_all[r_global],
-                trim=0.0
+                pi_target=pi_est_rounds_all[r_global]
             )
-            ### Debugging logs, kept since found to be very useful
-            # est = est_pack["est"]
-            # K_init   = float(est["K_est"])
-            # snr_init = float(est["snr_db_est"])
-            # K_true_r = float(train_K[s_split].item())
-            # print(f"[init-est train] ep={epoch+1} r={r_global} K_true={K_true_r:.1f} K_init={K_init:.2f}  "
-            #       f"SNR_true={snr_db_r:.1f}dB SNR_init={snr_init:.2f}dB")
-
             opt_amp.zero_grad(set_to_none=True)
             for i in range(s_split, e_split, args.pt_batch_size):
                 batch_x_true = train_set[i:i+args.pt_batch_size]
                 batch_k_true = train_K[i:i+batch_x_true.size(0)].to(dtype=torch.float32)
 
-                _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, K_a_batch=None, pi=est_pack["pi_round"], use_cached_sigma=True)
+                _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, pi=prep["pi_round"], use_cached_sigma=True)
                 loss = criterion(model, batch_x_true, x_hat, batch_k_true, k_final)
                 loss.backward()
                 losses.append(float(loss.item()))
@@ -436,23 +464,14 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                 r_global = blk.r_global
 
                 snr_db_r = val_snr_by_round[r_global] 
-                est_pack = estimate_and_cache_from_full_round(
-                    model,
-                    X_all=X_all,
-                    idx_all=idx_rounds_all,
-                    round_id=r_global,
-                    round_len=round_len,
-                    snr_db=snr_db_r,
-                    use_counts_pi=False,
-                    pi_target=pi_est_rounds_all[r_global],
-                    trim=0.0
-                )
-
+                prep = prepare_round(model, X_all, idx_rounds_all, r_global, round_len,
+                                     snr_db_signal=snr_db_r,
+                                     use_counts_pi=False, pi_target=pi_est_rounds_all[r_global])
                 for j in range(s_split, e_split, args.pt_batch_size):
                     batch_x_true = valid_set[j:j+args.pt_batch_size]
                     batch_k_true = valid_K[j:j+batch_x_true.size(0)].to(dtype=torch.float32)
 
-                    _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, K_a_batch=None, pi=est_pack["pi_round"], use_cached_sigma=True)
+                    _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, pi=prep["pi_round"], use_cached_sigma=True)
                     val_losses_round.append(criterion(model, batch_x_true, x_hat, batch_k_true, k_final).item())
 
         val_loss = float(np.mean(val_losses_round)) if val_losses_round else 0.0
@@ -480,7 +499,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
         print(f"Best Train Loss: {best_train_loss:.6f}, Best Validation Loss: {best_val_loss:.6f}")
 
     plot_pretraining(train_losses, val_losses, epoch+1, args.amp_lr, args.pt_batch_size, len(train_set), args.num_layers, args.save_dir)
-    save_pretrained_artifacts(model, args)
+    dec_pth, cb_pt = save_pretrained_artifacts(model, args)
 
     with torch.no_grad():
         amp = model.ampnet
@@ -523,12 +542,14 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
         "best_val_loss": float(best_val_loss) if best_val_loss is not None else None,
         "train_losses": [float(x) for x in train_losses],
         "val_losses": [float(x) for x in val_losses],
+        "decoder_pth": dec_pth,
+        "codebook_pt": cb_pt,
     }
     return model, pt_stats
 
 
 def evaluate_model(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_rounds_all, pi_targets_rounds_all, X_all, round_len, args):
-    """Evaluate model with per-round parameter estimation using the same noisy signals for decoding."""
+    """Evaluate model using the same noisy signals for decoding."""
     model.eval()
     nmse_values, accuracy_values, pupe_values = [], [], []
     estimation_logs = []
@@ -546,38 +567,22 @@ def evaluate_model(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_
 
             # Round-level metadata / targets
             pi_est  = pi_est_rounds_all[r]
-            pi_true = pi_targets_rounds_all[r]  # logging only
-            K_true  = float(test_K[s_loc].item())
 
             # Estimation using all samples from the round
             snr_db_r = eval_snr_by_round[r]
-            est_pack = estimate_and_cache_from_full_round(
+            prep = prepare_round(
                 model,
                 X_all=X_all,
                 idx_all=idx_rounds_all,
                 round_id=r,
                 round_len=round_len,
-                snr_db=snr_db_r,
-                use_counts_pi=False,         # use dataset π̂ for estimation
-                pi_target=pi_est,
-                trim=0.0
+                snr_db_signal=snr_db_r,
+                use_counts_pi=False,
+                pi_target=pi_est
             )
-            Z_full = est_pack["Z_full"]     # (S, d) noisy measurements used for estimation
-            est = est_pack["est"]           # K_est, m2_est, sigma2, snr_db_est
-
-            if getattr(blk, "sel_global", None):
-                # Gather exact offsets into this round
-                s_full = r * round_len
-                offs = torch.tensor(blk.sel_global, device=Z_full.device, dtype=torch.long) - s_full
-                Z_round = Z_full.index_select(0, offs)
-                idx_round_block = idx_rounds_all.index_select(0, torch.tensor(blk.sel_global, device=idx_rounds_all.device))
-            else:
-                # Backward-compatible contiguous slice
-                s_full = r * round_len
-                off0   = s_glb - s_full
-                off1   = off0 + (e_glb - s_glb)
-                Z_round = Z_full[off0:off1]
-                idx_round_block = idx_rounds_all[s_glb:e_glb]
+            Z_full = prep["Z_full"]
+            pi_for_round = prep["pi_round"]
+            Z_round = select_block_from_Z_full(blk, Z_full, round_len)
 
             # Subset to decode, using same noisy signals as estimated parameters with
             X_round = test_set[s_loc:e_loc]             # (B_r, n)
@@ -589,48 +594,35 @@ def evaluate_model(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_
 
             for offset in range(0, round_block_len, args.pt_batch_size):
                 batch_end = min(offset + args.pt_batch_size, round_block_len)
-                z_batch   = Z_round[offset:batch_end]                  # (B, d)
-                x_true_b  = X_round[offset:batch_end]                  # (B, n)
+                z_b = Z_round[offset:batch_end]                  # (B, d)
+                x_b = X_round[offset:batch_end]                  # (B, n)
 
                 # Use cached per-round params (snr_db=None, K_round=None)
-                x_est_b, k_final, K_trace, sigma_trace = model.ampnet(z_batch, model.C_syn, K_round=None, pi_round=pi_est, snr_db=None)
-                B_cur = z_batch.size(0)
+                x_est_b, k_final, K_trace, sigma_trace = model.ampnet(z_b, model.C_syn, pi_round=pi_for_round, snr_db=None)
+                B_cur = z_b.size(0)
                 k_last_vals.append(float(k_final))
                 sig_last_vals.append(float(sigma_trace[-1]))
                 weights.append(B_cur)
 
                 K_trace_batches.append(torch.tensor(K_trace, dtype=torch.float32))
                 sigma_trace_batches.append(torch.tensor(sigma_trace, dtype=torch.float32))
-                nmse_values.extend(compute_nmse_batch(x_true_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
-                accuracy_values.extend(compute_accuracy_batch(x_true_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
-                pupe_values.extend(compute_pupe_batch(x_true_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
+                nmse_values.extend(compute_nmse_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
+                accuracy_values.extend(compute_accuracy_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
+                pupe_values.extend(compute_pupe_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
 
             K_final_round = float(np.average(np.array(k_last_vals), weights=np.array(weights)))
             sigma2_final_round = float(np.average(np.array(sig_last_vals), weights=np.array(weights)))
             K_trace_full = torch.stack(K_trace_batches, dim=0).mean(dim=0).tolist()  # For ribbon logging only
             sigma_trace_full = torch.stack(sigma_trace_batches, dim=0).mean(dim=0).tolist()  # For ribbon logging only
 
-            # Final-after-layer-T parameter results
-            m2_final_est = m2_from_indices(idx_round_block, K_final_round, model.C_syn)
-            P_sig_final = (K_final_round**2) * m2_final_est / float(args.dim)
-            snr_final_db = 10.0 * math.log10(max(1e-12, P_sig_final) / max(1e-12, sigma2_final_round))
-            m2_true = m2_true_from_pi(pi_true, K_true, model.C_syn)  # logging
-
             estimation_logs.append({
                 "round_idx": round_idx,
                 "round_size": blk.block_len,
-                "K_true": K_true,
-                "K_est": est["K_est"],
-                "K_est_int": est["K_int"],
-                "snr_true": float(snr_db_r),
-                "snr_est": est["snr_db_est"],
-                "m2_true": m2_true,
-                "m2_est":  est["m2_est"],
-                "K_trace": K_trace_full,
-                "sigma_trace": sigma_trace_full,
+                "K_true": float(test_K[s_loc].item()),
                 "K_final": K_final_round,
                 "sigma2_final": sigma2_final_round,
-                "snr_final": snr_final_db,
+                "K_trace": K_trace_full,
+                "sigma_trace": sigma_trace_full,
             })
 
     avg_nmse = float(np.mean(nmse_values)) if nmse_values else float("nan")
@@ -639,17 +631,15 @@ def evaluate_model(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_
 
     # Logging
     print("\n=== Parameter Estimation Summary ===")
+    print("\n=== Parameter Summary (finals only) ===")
     for log in estimation_logs:
         print(f"Round {log['round_idx']:2d} (N={log['round_size']:4d}): "
-              f"K_true={log['K_true']:5.1f}  K_est={log['K_est']:5.2f}({log['K_est_int']:2d})  "
-              f"SNR_true={log['snr_true']:4.1f}dB  SNR_est={log['snr_est']:5.1f}dB  "
-              f"m2_true={log['m2_true']:.4f}  m2_est={log['m2_est']:.4f}  "
-              f"K_final={log['K_final']:.3f}  sigma2_final={log['sigma2_final']:.3e}  "
-              f"SNR_final={log['snr_final']:.2f}dB")
+            f"K_true={log['K_true']:5.1f}  K_final={log['K_final']:.3f}  "
+            f"sigma2_final={log['sigma2_final']:.3e}")
     print(f"\nJoint AMPNet - NMSE: {avg_nmse:.6f}, Accuracy: {avg_accuracy:.6f}")
-    plot_estimation_diagnostics(estimation_logs, args.save_dir)
     plot_parameter_traces(estimation_logs, args.save_dir)
     return avg_nmse, avg_accuracy, avg_pupe
+
 
 def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_rounds_all, X_all, round_len, args, test_snr_fixed: float | None = None):
     """
@@ -689,36 +679,24 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
             X_block  = test_set[s_loc:e_loc]
             pi_est = pi_est_rounds_all[r]
 
-            est_pack = estimate_and_cache_from_full_round(
+            prep = prepare_round(
                 model,
                 X_all=X_all,
                 idx_all=idx_rounds_all,
                 round_id=r,
                 round_len=round_len,
-                snr_db=snr_db_r,
-                use_counts_pi=False,     # use dataset π̂
-                pi_target=pi_est,
-                trim=0.0
+                snr_db_signal=snr_db_r,
+                use_counts_pi=False,
+                pi_target=pi_est
             )
-            Z_full = est_pack["Z_full"]
-            pi_est = est_pack["pi_round"]
-
-            s_full = r * round_len
-            if getattr(blk, "sel_global", None):
-                offs = torch.tensor(blk.sel_global, device=Z_full.device, dtype=torch.long) - s_full
-                Z_block = Z_full.index_select(0, offs)
-                idx_block = idx_rounds_all.index_select(0, torch.tensor(blk.sel_global, device=idx_rounds_all.device))
-            else:
-                off0 = s_glb - s_full
-                off1 = off0 + (e_glb - s_glb)
-                Z_block = Z_full[off0:off1]
-                idx_block = idx_rounds_all[s_glb:e_glb]
+            Z_full = prep["Z_full"]
+            pi_est = prep["pi_round"]
+            Z_round = select_block_from_Z_full(blk, Z_full, round_len)
 
             # Same noisy signals used, slicing converted to offset for batching
             Z_ampda_block, A_ampda = bernoulli_encode_with_noise(X_block, n=model.ampnet.n, d=model.ampnet.d, snr_db=snr_db_r, device=X_block.device, dtype=X_block.dtype)
-            A_ampda = A_ampda.to(args.device).float()
 
-            # Runs AMPNet over all batches, decodes, gathers final K & sigma2
+            # Runs AMP-DA-Net over all batches, decodes, gathers final K & sigma2
             K_last_vals, K_last_wts = [], []
             Sig_last_vals, Sig_last_wts = [], []
             cache_ampnet_out, cache_z_np, cache_z_ampda, cache_x_true_np = [], [], [], []
@@ -726,7 +704,7 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
             round_block_len = X_block.size(0)
             for offset in range(0, round_block_len, args.pt_batch_size):
                 batch_end = min(offset + args.pt_batch_size, round_block_len)
-                z_batch       = Z_block[offset:batch_end]
+                z_batch       = Z_round[offset:batch_end]
                 z_batch_ampda = Z_ampda_block[offset:batch_end]
                 x_true_b      = X_block[offset:batch_end]
 
@@ -734,10 +712,7 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
                     print(f"[warn] empty batch at offset={offset}, block_len={round_block_len} — skipping")
                     continue
 
-                x_ampnet_b, k_final, _, sigma_trace = model.ampnet(
-                    z_batch, model.C_syn, K_round=None, pi_round=pi_est, snr_db=None
-                )
-
+                x_ampnet_b, k_final, _, sigma_trace = model.ampnet(z_batch, model.C_syn, pi_round=pi_est, snr_db=None)
                 cache_ampnet_out.append(x_ampnet_b.detach().cpu().numpy())
                 cache_z_np.append(z_batch.detach().cpu().numpy())
                 cache_z_ampda.append(z_batch_ampda.detach().cpu().numpy())
@@ -754,20 +729,14 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
             K_final_round       = float(np.average(np.array(K_last_vals),  weights=np.array(K_last_wts)))
             sigma2_final_round  = float(np.average(np.array(Sig_last_vals), weights=np.array(Sig_last_wts)))
             K_int_final         = int(round(max(0.0, min(float(model.ampnet.n), K_final_round))))
-
-            # Optional SNR diagnostic using final K and block indices
-            d = model.ampnet.d
-            m2_final_est  = m2_from_indices(idx_block, K_final_round, model.C_syn)
-            P_sig_final   = (K_final_round**2) * m2_final_est / float(d)
-            snr_final_db  = 10.0 * math.log10(max(1e-12, P_sig_final) / max(1e-12, sigma2_final_round))
             print(f"[Round {round_idx}] K_final={K_final_round:.3f} (int {K_int_final}), "
-                  f"sigma2_final={sigma2_final_round:.3e}, SNR_final={snr_final_db:.2f} dB")
+                  f"sigma2_final={sigma2_final_round:.3e}")
 
             # Metrics for comparison decoders, using same noisy signals
             for b in range(len(cache_ampnet_out)):
                 x_ampnet_np = cache_ampnet_out[b]
                 z_np        = cache_z_np[b]
-                z_ampda_np  = torch.from_numpy(cache_z_ampda[b]).to(args.device)
+                z_ampda_np  = cache_z_ampda[b]
                 x_true_np   = cache_x_true_np[b]
 
                 # AMP-DA
@@ -784,23 +753,21 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
 
                 B = x_true_np.shape[0]
                 for j in range(B):
-                    # 3) AMPNet Enhanced
+                    # 3) AMP-DA-Net Enhanced
                     results_data['amp-da-net']['nmse'].append(compute_nmse(x_true_np[j], x_ampnet_np[j]))
                     results_data['amp-da-net']['acc'].append(compute_accuracy(x_true_np[j], x_ampnet_np[j]))
                     results_data['amp-da-net']['pupe'].append(compute_pupe(x_true_np[j], x_ampnet_np[j]))
 
                     # 4) ISTA (baseline) with final K
                     try:
-                        z_b = cache_z_ampda[b].astype(np.float32) 
-                        A_ampda_np = A_ampda.detach().cpu().numpy().astype(np.float32)
-                        x_est_ista = ista(z_b[j], A_ampda_np)  # Also tested with fixed construct codebook and noisy signals for fairness
+                        x_est_ista = ista(z_np[j], A_np)
                         results_data['ista']['nmse'].append(compute_nmse(x_true_np[j], x_est_ista))
                         results_data['ista']['acc'].append(compute_accuracy(x_true_np[j], x_est_ista))
                         results_data['ista']['pupe'].append(compute_pupe(x_true_np[j], x_est_ista))
                     except Exception as e:
                         print(f"Warning: ISTA failed for sample {j}: {e}")
 
-                    # 5) AMPNet + Basic post with final K
+                    # 5) AMP-DA-Net + Basic post with final K
                     try:
                         x_post_basic = np.clip(x_ampnet_np[j], a_min=0, a_max=None)
                         x_post_basic = greedy_rounding(x_post_basic, K_int_final)
@@ -816,7 +783,7 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
                         results_data['amp-da']['acc'].append(compute_accuracy(x_true_np[j], x_ampda_np[j]))
                         results_data['amp-da']['pupe'].append(compute_pupe(x_true_np[j], x_ampda_np[j]))
 
-                    # 7) AMPNet + advanced post with final K
+                    # 7) AMP-DA-Net + advanced post with final K
                     try:
                         x_adv = top_k_nonneg(x_ampnet_np[j], K_int_final)
                         x_adv = l2_refit_on_support(z_np[j], A_np, x_adv, ridge=1e-6, nonneg=True)
@@ -1045,10 +1012,10 @@ if __name__ == "__main__":
     os.makedirs(summ_dir, exist_ok=True)
 
     # 1) Minimal “finals” for logging 
-    ampnet_raw      = _triplet_to_dict(results_avg, 'amp-da-net')
-    ampnet_basic    = _triplet_to_dict(results_avg, 'amp-da-net_v1')
-    ampnet_adv      = _triplet_to_dict(results_avg, 'amp-da-net_v2')
-    ista_basic      = _triplet_to_dict(results_avg, 'ista')
+    ampnet_raw       = _triplet_to_dict(results_avg, 'amp-da-net')
+    ampnet_basic     = _triplet_to_dict(results_avg, 'amp-da-net_v1')
+    ampnet_adv       = _triplet_to_dict(results_avg, 'amp-da-net_v2')
+    ista_basic       = _triplet_to_dict(results_avg, 'ista')
     amp_da_baseline  = _triplet_to_dict(results_avg, 'amp-da')
 
     finals = dict(
@@ -1084,11 +1051,19 @@ if __name__ == "__main__":
     print(f"Training completed. Results saved to {args.save_dir}")
 
     # Analyse final models & codebooks
+    analysis_fig_path = os.path.join(args.save_dir, "codebook_analysis", "codebook_analysis.png")
     URA_codebook_metrics = analyse_codebook(
         decoder_model.C_syn.data.clone().T,
         plot=True,
         k_rip=args.max_p,
-        save_path=os.path.join(args.save_dir, "codebook_analysis"),
+        save_path=analysis_fig_path,
         show_plots=False
     )
     print_codebook_analysis(URA_codebook_metrics, print_full=True)
+    save_codebook_analysis_artifacts(
+        URA_codebook_metrics,
+        args,
+        codebook_pt_path=pt_stats.get("codebook_pt", None),
+        plot_path=analysis_fig_path,
+        base_name="codebook_analysis"
+    )

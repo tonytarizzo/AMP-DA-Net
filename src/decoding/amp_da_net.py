@@ -5,25 +5,16 @@ import torch.nn as nn
 
 
 class AMPNet1DEnhanced(nn.Module):
-    """
-    AMP-DM-Net (parameter-informed, deployable)
-      - start_new_round(z_round, pi_round, m2_round, ...): sets K, σ² from your per-round stats
-      - Output block: GAMP-style with learnable residual scale & damping
-      - Pseudo-channel: R = var2/var1 + x, Vi = 1/var1 (with mild inv-scale)
-      - Denoiser: spike+Poisson Bayes -> (m1,var), then CNN refine & blend
-      - Per-layer alpha-mix (prior vs posterior)
-      - Optional per-layer fine-tuning of K, π, σ² via learned step sizes (no hand damping)
-    """
     def __init__(self, URA_codebook, num_layers=10, num_filters=32, kernel_size=3,
                  use_poisson=True,
                  update_alpha=True,
-                 learn_sigma2=True,
-                 finetune_K=True, 
-                 finetune_pi=True, 
-                 finetune_sigma2=True, 
-                 K_max=None,  # if None, uses 2 * K_init_estimate
+                 learn_sigma2=False,
+                 finetune_K=True,
+                 finetune_pi=True,
+                 finetune_sigma2=True,
+                 K_max=None,
                  blend_init=0.85,
-                 per_sample_sigma=True,
+                 per_sample_sigma=False,
                  per_sample_alpha=False):
         super().__init__()
         C = URA_codebook if torch.is_tensor(URA_codebook) else torch.tensor(URA_codebook, dtype=torch.float32)
@@ -85,11 +76,22 @@ class AMPNet1DEnhanced(nn.Module):
             "K_float": None,     # scalar
             "K_int":   None,     # int used only for logging, never in math
             "sigma2":  None,     # scalar per round
-            "m2":      None      # scalar per round (kept for completeness)
         }
         self._current_codebook_id = None
+        self.init_policy   = "const_sigma2"   # or "snr_db"
+        self.sigma2_const  = 100.0            # used when init_policy == "const_sigma2"
+        self.snr_init_db   = -100.0           # used when init_policy == "snr_db"
 
-    # ---------- utils ----------
+    def set_init_const(self, sigma2: float):
+        self.init_policy  = "const_sigma2"
+        self.sigma2_const = float(sigma2)
+        return self
+
+    def set_init_from_snr_db(self, snr_db: float):
+        self.init_policy = "snr_db"
+        self.snr_init_db = float(snr_db)
+        return self
+
     @staticmethod
     def _scale_centered(param, low, high):
         mid  = 0.5 * (low + high)
@@ -123,58 +125,26 @@ class AMPNet1DEnhanced(nn.Module):
         
     # ---------- per-round initialization ----------
     @torch.no_grad()
-    def start_new_round(self, z_round, pi_round, m2_round,
-                        *, external_URA_codebook=None, trim=0.0):
-        """
-        Initialize round parameters from provided statistics (Option-2 style).
-          K  ← matched-filter along Gπ
-          σ² ← mean(||y||²)/d - (K² m2)/d
-        Inputs
-          z_round : (B_r, d)  noisy measurements for the new round
-          pi_round: (n,)      per-round π estimate from your dataset
-          m2_round: float     per-round m2 estimate from your dataset
-        """
+    def start_new_round(self, z_round, pi_round, *, external_URA_codebook=None):
         C_nt = external_URA_codebook if external_URA_codebook is not None else self.C_nt
         self.update_codebook_cache(C_nt, pi_round)
 
-        device = z_round.device
-        C_dn   = self._cached["C_dn"]
-        g_pi   = self._cached["g_pi"]
-        d, n   = self.d, self.n
-        eps    = self._eps()
-
-        # --- K via matched filter along Gπ ---
-        r_bar = (z_round @ C_dn).mean(dim=0)          # (n,)
-        if g_pi is None:  # fallback (should not happen if pi_round provided)
-            gram = self._cached["gram"]
-            g_pi = gram @ self._normalize_pi(pi_round.to(device).flatten())
-        denom = float((g_pi * g_pi).sum().clamp_min(eps).item())
-        K_mf  = float((r_bar * g_pi).sum().item() / denom)
-        K_mf  = max(0.0, min(float(n), K_mf))
-
-        # --- Per-dimension energy and σ² via m2 identity ---
-        Y_per_dim = (z_round.pow(2).sum(dim=1) / float(d))      # (B_r,)
-        if (trim > 0.0) and (Y_per_dim.numel() >= 10):
-            k = int(trim * Y_per_dim.numel())
-            Y_sorted = torch.sort(Y_per_dim).values
-            Y_bar = float(Y_sorted[k: Y_sorted.numel()-k].mean().item())
+        Ka0 = 10.0
+        self._round_params["K_float"] = Ka0
+        self._round_params["K_int"] = int(round(Ka0))
+        if self.init_policy == "const_sigma2":
+            sigma2 = float(self.sigma2_const)
+        elif self.init_policy == "snr_db":
+            snr_lin = 10.0 ** (self.snr_init_db / 10.0)
+            if self.per_sample_sigma:
+                Py = z_round.pow(2).mean(dim=1, keepdim=True)     # (B,1)
+                sigma2 = (Py / (1.0 + snr_lin)).clamp_min(self._eps())
+            else:
+                Py = z_round.pow(2).mean()
+                sigma2 = max(self._eps(), float(Py.item() / (1.0 + snr_lin)))
         else:
-            Y_bar = float(Y_per_dim.mean().item())
-
-        m2_r = float(max(eps, float(m2_round)))
-        P_sig = (K_mf**2) * m2_r / float(d)
-
-        # Optional Guard for very small noise estimations that blow up posterlikelihood weighting
-        Y_guard = 0.98 * Y_bar
-        if P_sig >= Y_guard:
-            # minimally back off K to satisfy energy identity
-            K_cap_e = math.sqrt(Y_guard * d / max(eps, m2_r))
-            K_mf = min(K_mf, K_cap_e)
-            P_sig = (K_mf**2) * m2_r / float(d)
-        sigma2 = max(eps, Y_bar - P_sig)
-
-        K_int = int(round(max(0.0, min(float(n), K_mf))))
-        self._round_params.update(dict(K_float=K_mf, K_int=K_int, sigma2=sigma2, m2=m2_r))
+            raise ValueError(f"Unknown init_policy: {self.init_policy}")
+        self._round_params["sigma2"] = sigma2
 
     # ---------- discrete Bayes table ----------
     def _discrete_mmse_counts(self, R, Vi, alpha, lam, K_max, tau):
@@ -218,7 +188,7 @@ class AMPNet1DEnhanced(nn.Module):
         alpha_post = post[:, :, 1:].sum(dim=2).clamp(1e-10, 1-1e-10)
         return m1, var, alpha_post, post
 
-    def forward(self, y, external_URA_codebook=None, K_round=None, pi_round=None, snr_db=None):
+    def forward(self, y, external_URA_codebook=None, pi_round=None, snr_db=None):
         """
         y: (B,d)
         If K_round / snr_db are None, use start_new_round() cached values.
@@ -227,7 +197,7 @@ class AMPNet1DEnhanced(nn.Module):
         device = y.device
         C_nt = external_URA_codebook.to(device) if external_URA_codebook is not None else self.C_nt
         if (self._cached["C_dn"] is None) or (int(C_nt.data_ptr()) != self._current_codebook_id):
-            # keep cache coherent (uses pi_round only for Gπ, not mandatory here)
+            # keep cache coherent
             self.update_codebook_cache(C_nt, pi_round)
 
         C_dn, C2, C2T = self._cached["C_dn"], self._cached["C2"], self._cached["C2T"]
@@ -238,15 +208,8 @@ class AMPNet1DEnhanced(nn.Module):
         assert pi_round is not None, "pi_round must be provided to forward()"
         pi = self._normalize_pi(pi_round.to(device).flatten())
 
-        # K init: prefer cached start_new_round() unless explicitly overridden
-        if K_round is None and self._round_params["K_float"] is not None:
-            Ka = torch.as_tensor(self._round_params["K_float"], device=y.device, dtype=y.dtype)
-        else:
-            Ka0 = (K_round.reshape(-1)[0].item() if torch.is_tensor(K_round) else float(K_round))
-            Ka  = torch.as_tensor(max(0.0, min(float(self.n), Ka0)), device=y.device, dtype=y.dtype)
+        Ka = torch.as_tensor(self._round_params["K_float"], device=y.device, dtype=y.dtype)
         K_trace = [Ka.detach().item()]  # logging only
-
-        # K_max grid
         K_max = (int(self.fixed_Kmax) if self.fixed_Kmax is not None else int(max(8, int((2 * Ka).item()))))
 
         # λ, α0
@@ -336,7 +299,7 @@ class AMPNet1DEnhanced(nn.Module):
 
             # K update (learned step in (0,2))
             if self.finetune_K:
-                sK = 2.0 * torch.sigmoid(self.k_step_raw[t])
+                sK = 1.0 if t == 0 else (2.0 * torch.sigmoid(self.k_step_raw[t]))
                 Ka = torch.clamp(Ka + sK * (K_post - Ka), 0.0, float(self.n))  # keep Ka as tensor
 
             # π update (learned step in (0,1))

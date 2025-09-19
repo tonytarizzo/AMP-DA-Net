@@ -14,11 +14,6 @@ from .metrics import (
 from .parameter_estimation import (
     compute_pi_distribution,
     pi_from_indices,
-    estimate_K_mf,
-    m2_from_indices,
-    m2_from_indices_counts,
-    m2_from_idxmini_u_stat,
-    m2_true_from_pi,
 )
 from .codebook_analysis import (
     visualise_codebook_heatmap,
@@ -35,12 +30,12 @@ from .logging import (
     save_round_history_csv,
     run_manifest,
     _triplet_to_dict,
+    save_pi_minimal_artifacts,
 )
 from .visualisations import (
     plot_codebook_ordering,
     plot_dataset_collection_history,
     plot_pretraining,
-    plot_estimation_diagnostics,
     plot_parameter_traces,
     plot_inference_history,
 )

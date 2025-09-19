@@ -1,6 +1,6 @@
 # AMP-DA-Net
 
-Supporting code for **“Over-the-Air Federated Learning in Low-SNR Regimes” (2025)**.  
+Supporting code for **“Learned Digital Codes for Over-the-Air Federated Learning” (2025)**.  
 This repo contains three end-to-end stages:
 
 1) **Dataset collection** (simulate FL + wireless compression, save iFed bundles)  
@@ -34,7 +34,7 @@ If you use this code in your work, please cite (although it is not yet an offici
 
 ```
 @article{tarizzo2025ampdanet,
-  title   = {Over-the-Air Federated Learning in Low-SNR Regimes},
+  title   = {Learned Digital Codes for Over-the-Air Federated Learning},
   author  = {Antonio Tarizzo, Mohammad Kazemi, Deniz Gündüz},
   year    = {2025}
 }

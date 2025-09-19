@@ -7,6 +7,8 @@ import platform
 import datetime
 import numpy as np
 import torch
+import time
+
 
 def _to_py(x):
     if isinstance(x, (float, int, str, bool)) or x is None: return x
@@ -60,7 +62,7 @@ def run_manifest(args, extra=None):
         model=str(getattr(args,"model","")),
         codebook_init=str(getattr(args,"codebook_init","")),
         codebook_trainable=bool(getattr(args,"codebook_trainable", True)),
-        within_round=str(getattr(args,"within_round","prefix")).lower(),  # NEW
+        within_round=str(getattr(args,"within_round","prefix")).lower(),
         K_t=int(getattr(args,"K_t",-1)),
         min_p=int(getattr(args,"min_p",-1)),
         max_p=int(getattr(args,"max_p",-1)),
@@ -77,3 +79,52 @@ def _triplet_to_dict(results_avg, key):
         return {"nmse": (None if nmse is None else float(nmse)),
                 "acc":  (None if acc  is None else float(acc)),
                 "pupe": (None if pupe is None else float(pupe))}
+
+def save_pi_minimal_artifacts(bundle_path: str, args, base_name: str = "pi_rounds_min"):
+    # --- load bundle ---
+    bundle = torch.load(bundle_path, map_location="cpu")
+    PT = bundle["pi_targets"].to(torch.float32).cpu().numpy()   # (R, n)
+    PE = bundle["pi_estimates"].to(torch.float32).cpu().numpy() # (R, n)
+    meta = bundle.get("meta", {})
+    R, n = PT.shape
+
+    # --- save arrays ---
+    out_dir = os.path.join(args.save_dir, "summaries")
+    os.makedirs(out_dir, exist_ok=True)
+    npz_path = os.path.join(out_dir, f"{base_name}.npz")
+    np.savez_compressed(npz_path, pi_targets=PT, pi_estimates=PE)
+
+    # --- JSON sidecar (lightweight) ---
+    def _rel(p):
+        try:
+            return os.path.relpath(p, args.save_dir)
+        except Exception:
+            return p
+
+    sidecar = {
+        "artifact": "pi_rounds_min",
+        "version": 1,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "shapes": {"R": int(R), "n": int(n)},
+        "files": {"arrays_npz": _rel(npz_path), "dataset_bundle": bundle_path},
+        "dataset_meta": meta,
+        "context": {
+            "save_dir": args.save_dir,
+            "seed": int(getattr(args, "seed", -1)),
+            "n": int(getattr(args, "n", -1)),
+            "dim": int(getattr(args, "dim", -1)),
+            "message_split": int(getattr(args, "message_split", -1)),
+            "K_t": int(getattr(args, "K_t", -1)),
+            "min_p": int(getattr(args, "min_p", -1)),
+            "max_p": int(getattr(args, "max_p", -1)),
+            "frac_random": float(getattr(args, "frac_random", float("nan"))),
+            "model": getattr(args, "model", None),
+            "code_order": getattr(args, "code_order", None),
+        },
+    }
+    json_path = os.path.join(out_dir, f"{base_name}.json")
+    with open(json_path, "w") as f:
+        json.dump(sidecar, f, indent=2)
+
+    print(f"[save] π arrays → {npz_path}")
+    print(f"[save] π sidecar → {json_path}")

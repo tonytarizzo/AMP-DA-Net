@@ -4,6 +4,11 @@ python -u -m scripts.1_dataset_collection \
   --data-dir              "runs/datasets" \
   --save-dir              "runs/results" \
   \
+  --train-size             40000 \
+  --valid-size             10000 \
+  --test-size              2000 \
+  --early-stopping-patience 1000 \
+  \
   --model                 resnet \
   --K-t                   40 \
   --min-p                 7 \
@@ -17,7 +22,6 @@ python -u -m scripts.1_dataset_collection \
   \
   --total-rounds          1000 \
   --local-epochs          3 \
-  --local-batch-size      20 \
   --local-lr              0.01 \
   \
   --optimizer             fedavg \

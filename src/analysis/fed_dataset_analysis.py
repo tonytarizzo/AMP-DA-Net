@@ -3,16 +3,10 @@ import os
 import torch
 import matplotlib.pyplot as plt
 from .metrics import kl_divergence, normalized_entropy, gini_coefficient, topk_mass
-from .parameter_estimation import estimate_K_mf, m2_from_indices_counts, m2_from_idxmini_u_stat
-from ..codebooks.operations import normalize_codebook
-from ..utils.channel import add_awgn_noise
-from ..utils.helpers import split_rounds_concatenated
 
-def analyze_dataset(path, args, rounds_to_plot=None, save_dir="analysis_results"):
+def analyze_dataset(path, rounds_to_plot=None, save_dir="analysis_results"):
     data = torch.load(path)
     X, K_rounds, pi_targets, pi_estimates = data['X'], data['K_rounds'], data['pi_targets'], data['pi_estimates']
-    device_idx = data.get('device_idx', None)
-    round_len  = int(data.get('round_len', 0))
     os.makedirs(save_dir, exist_ok=True)
 
     # 1) Round-by-round K_a 
@@ -167,47 +161,4 @@ def analyze_dataset(path, args, rounds_to_plot=None, save_dir="analysis_results"
     plt.savefig(lorenz_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Lorenz estimate curve plot saved to {lorenz_path}")
-
-
-    # Second moment analysis with demo Gaussian codebook
-    C_nt = normalize_codebook(torch.randn(args.n, args.dim, device=X.device))
-    X_rounds   = split_rounds_concatenated(X, round_len)            # list of (S,n) counts over all devices (for Y only)
-    idx_rounds = split_rounds_concatenated(device_idx, round_len)   # list of (S,) idx_mini
-    pi_rounds  = [pi_estimates[r] for r in range(len(K_rounds))]    # (R, n), estimated from the same idx_mini
-
-    m2_true_list, m2_est_list = [], []
-    for r in range(len(K_rounds)):
-        K_true = int(K_rounds[r])
-        Xr     = X_rounds[r]                # (S,n) counts (used only to *synthesize* Y the BS would observe)
-        idxr   = idx_rounds[r]              # (S,) mini-dataset assignments
-        pi_r   = pi_rounds[r]               # (n,) estimated π from idxr
-
-        # BS observation for this round (what you would have in inference)
-        Y_clean = Xr @ C_nt                 # (S,d)
-        Y_noisy = add_awgn_noise(Y_clean, args.snr_db)
-
-        # K̂ from MF using the same π̂ source as m2 (consistency)
-        K_probe = estimate_K_mf(Y_noisy, pi_r, C_nt)
-
-        # m2 estimate from idx_mini only (U-stat over the full idx vector)
-        m2_est  = m2_from_indices_counts(idxr, K_probe, C_nt)
-
-        # Reference "true" curve (for evaluation only)
-        m2_true = m2_from_idxmini_u_stat(C_nt, Xr, K_true)
-
-        m2_true_list.append(m2_true)
-        m2_est_list.append(m2_est)
-
-    m2_true = torch.tensor(m2_true_list)
-    m2_est  = torch.tensor(m2_est_list)
-
-    plt.figure(figsize=(10,6))
-    plt.plot(range(1, len(m2_true)+1), m2_true.cpu().numpy(), label='m2_true', linewidth=2)
-    plt.plot(range(1, len(m2_est)+1),  m2_est.cpu().numpy(),  label='m2_est(idx_mini + K̂)', linewidth=2)
-    plt.xlabel("Round"); plt.ylabel("m2")
-    plt.title("Per-round second moment: true vs inference-visible estimate")
-    plt.legend(); plt.grid(True, linestyle='--', alpha=0.5)
-    pth = os.path.join(save_dir, "m2_estimation_consistent.png")
-    plt.tight_layout(); plt.savefig(pth, dpi=300, bbox_inches='tight'); plt.close()
-    print(f"Second moment analysis plot saved to {pth}")
     return metrics

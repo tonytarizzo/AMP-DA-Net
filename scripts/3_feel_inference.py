@@ -12,11 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 from sklearn.cluster import kmeans_plusplus
 
 from src.analysis import (
-    m2_from_indices, 
     error_feedback_info,
     compute_bits_per_dimension,
     compute_ul_overhead,
@@ -81,6 +79,7 @@ class WirelessCompressor(nn.Module):
         ).to(device)
         self.ampnet.load_state_dict(amp_state, strict=True)
         self.ampnet.eval()
+        self.ampnet.set_init_const(100.0)
 
         # 3) Working quantizer codebook for this round (n x L), refreshed each round & criterion function
         self.register_buffer("Q_codebook", torch.zeros(args.n, args.message_split, device=device))
@@ -110,61 +109,6 @@ class WirelessCompressor(nn.Module):
             ura_words_list[start_idx:end_idx] = ura_words
         return indices_list, quant_words_list, ura_words_list
 
-    # @torch.no_grad()
-    # def estimate_round(self, Z_round, pi_round, idx_round, trim=0.0):
-    #     self.ampnet.update_codebook_cache(self.C_syn, pi_round)
-    #     C_dn  = self.ampnet._cached["C_dn"]
-    #     g_pi  = self.ampnet._cached["g_pi"]
-    #     d     = self.dim
-
-    #     r_bar = (Z_round @ C_dn).mean(dim=0)
-    #     denom = (g_pi * g_pi).sum().clamp_min(1e-12)
-    #     K_est = float((r_bar * g_pi).sum().item() / denom.item())
-    #     K_est = max(0.0, min(float(self.n), K_est))
-
-    #     m2_hat = m2_from_indices(idx_round, K_est, self.C_syn)
-
-    #     Y_bar  = float((Z_round.pow(2).sum(dim=1) / float(d)).mean().item())
-    #     sigma2 = max(1e-12, Y_bar - (K_est**2) * m2_hat / float(d))
-
-    #     # just set (no recompute)
-    #     self.ampnet.set_round_params(K_float=K_est, sigma2=sigma2, m2=m2_hat)
-
-    #     snr_db_est = 10.0 * math.log10(max(1e-12, (K_est**2)*m2_hat/float(d)) / max(1e-12, sigma2))
-    #     return dict(K_est=K_est, K_int=int(round(K_est)), m2_est=m2_hat, sigma2=sigma2, snr_db_est=snr_db_est)
-
-    # @torch.no_grad()
-    # def set_round_params(self, K_float, sigma2, m2):
-    #     self._round_params.update(dict(K_float=float(K_float),
-    #                                 K_int=int(round(max(0.0, min(float(self.n), float(K_float))))),
-    #                                 sigma2=float(sigma2),
-    #                                 m2=float(m2)))
-
-    @torch.no_grad()
-    def estimate_round(self, Z_round, pi_round, idx_round, trim=0.0):
-        # K via MF + m2 via U-stat → cache σ² inside AMPNet
-        self.ampnet.update_codebook_cache(self.C_syn, pi_round)
-        C_dn  = self.ampnet._cached["C_dn"]
-        gram  = self.ampnet._cached["gram"]
-        pi_n  = self.ampnet._normalize_pi(pi_round.flatten())
-        g_pi  = gram @ pi_n
-        r_bar = (Z_round @ C_dn).mean(dim=0)
-        denom = float((g_pi * g_pi).sum().clamp_min(1e-12).item())
-        K_est = float((r_bar * g_pi).sum().item() / denom)
-        K_est = max(0.0, min(float(self.n), K_est))
-        m2_hat = m2_from_indices(idx_round, K_est, self.C_syn)
-
-        self.ampnet.start_new_round(
-            z_round=Z_round, pi_round=pi_round, m2_round=m2_hat,
-            external_URA_codebook=self.C_syn, trim=trim
-        )
-
-        # SNR(dB) (for logs only)
-        sig2 = float(self.ampnet._round_params["sigma2"])
-        P_sig = (K_est**2) * m2_hat / float(self.dim)
-        snr_db_est = 10.0 * math.log10(max(1e-12, P_sig) / max(1e-12, sig2))
-        return dict(K_est=K_est, K_int=int(round(K_est)), m2_est=m2_hat, sigma2=sig2, snr_db_est=snr_db_est)
-
     def _aggregate_Ka(self, Ka_list, weights):
         if not Ka_list: return float("nan")
         return float(np.average(np.array(Ka_list), weights=np.array(weights)))
@@ -192,14 +136,13 @@ class WirelessCompressor(nn.Module):
         # 0) Init/caches
         device = y.device
         n = self.C_syn.size(0)
-        est = self.estimate_round(y, pi_est, idx_mini, trim=trim)
+        self.ampnet.start_new_round(
+            z_round=y,
+            pi_round=pi_est,
+            external_URA_codebook=self.C_syn
+        )
 
-        # Debugging info
-        # K_mf0 = float(est["K_est"])
-        # snr0  = float(est["snr_db_est"])
-        # print(f"[debug] MF init: K_mf0={K_mf0:.3f}, snr0={snr0:.2f} dB")
-
-        # 1) Run AMPNet across the round in chunks
+        # 1) Run AMP-DA-Net across the round in chunks
         X_raw = torch.empty((S, n), device=device, dtype=y.dtype)
         Ka_vals, weights, sigma_last_vals = [], [], []
         loss_sum = 0.0
@@ -209,7 +152,7 @@ class WirelessCompressor(nn.Module):
             end = min(S, start + self.grad_accumulation_size)
             z_b = y[start:end]
             x_raw, k_raw, _, sigma_trace_b = self.ampnet(
-                z_b, external_URA_codebook=self.C_syn, K_round=None, pi_round=pi_est, snr_db=None
+                z_b, external_URA_codebook=self.C_syn, pi_round=pi_est, snr_db=None
             )
 
             X_raw[start:end] = x_raw.detach()
@@ -245,15 +188,15 @@ class WirelessCompressor(nn.Module):
         ampnet_acc  = float(np.mean(acc_vec))
         ampnet_pupe = float(np.mean(pupe_vec))
 
-        # final SNR using clean power per-split if provided; else MF m2 fallback
+        # final SNR using clean power per-split if provided; else from y-energy minus σ²
         if z_clean is not None:
             P_sig_per = z_clean.pow(2).mean(dim=1)  # (S,)
             snr_lin_per = (P_sig_per / max(1e-12, sigma2_final)).detach().cpu().numpy()
             snr_final_db = 10.0 * math.log10(max(1e-12, float(np.mean(snr_lin_per))))
         else:
-            m2_final_est = m2_from_indices(idx_mini, K_est_final, self.C_syn)
-            P_sig_final = (K_est_final**2) * m2_final_est / float(self.dim)
-            snr_final_db = 10.0 * math.log10(max(1e-12, P_sig_final) / max(1e-12, sigma2_final))
+            Py = float(y.pow(2).mean().item())
+            P_sig = max(0.0, Py - float(sigma2_final))  # unbiased if y = signal + AWGN
+            snr_final_db = 10.0 * math.log10(max(1e-12, P_sig) / max(1e-12, float(sigma2_final)))
 
         return recovered_flat, K_est_final, K_int_final, ampnet_loss, ampnet_acc, ampnet_pupe, sigma2_final, snr_final_db
 
@@ -263,7 +206,7 @@ class WirelessCompressor(nn.Module):
           (a) build Q via k-means++ on base-station mini dataset,
           (b) compute idx_mini + π̂, then reorder {Q, idx_mini, π̂} by args.code_order (NOT URA),
           (c) quantize all device splits with Q,
-          (d) build targets + π_target, apply SAME permutation,
+          (d) build targets + π_target, apply same permutation,
           (e) sum URA words, add noise, decode with AMP-DA-Net.
         """
         K_a, D = deltas_w_feedback.shape
@@ -283,12 +226,11 @@ class WirelessCompressor(nn.Module):
         dists_mini = torch.cdist(mini, new_Q, p=2)
         idx_mini = torch.argmin(dists_mini, dim=1)                  # (S,)
         pi_est = torch.bincount(idx_mini, minlength=args.n).float()
-        pi_est = (pi_est / pi_est.sum().clamp_min(1e-12)).contiguous()  # Is this any different to pi_est /= (pi_est.sum() + 1e-12)
+        pi_est = (pi_est / pi_est.sum().clamp_min(1e-12)).contiguous()
 
         # 2.5) Re-order quantisation codebook, idx_mini & pi distribution
         perm_used, inv_perm_used = get_round_perm(args.code_order, new_Q, idx_mini, pi_est)
-
-        with torch.no_grad():  # This bit seems the same as the above commented, that was used in dataset collection
+        with torch.no_grad():
             self.Q_codebook.copy_(new_Q if perm_used is None else new_Q[perm_used])
         pi_est = pi_est if perm_used is None else pi_est[perm_used]
         idx_mini = idx_mini if inv_perm_used is None else inv_perm_used[idx_mini]
@@ -332,7 +274,7 @@ def federated_training(
     device: torch.device,
 ):
     """
-    Federated learning with wireless channel compression using AMP-DM-Net
+    Federated learning with wireless channel compression using AMP-DA-Net
     Args:
         global_model: the ResNetS model
         device_loaders: list of DataLoaders, one per device with on-fly transformations
@@ -352,12 +294,6 @@ def federated_training(
     bpd = compute_bits_per_dimension(args.n, args.message_split)
     print(f"Bits per dimension: {bpd:.3f} bits/dim")
 
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
 
     # 1) Global optimizer & history init
     momentum_buffer_list = [torch.zeros_like(p.data, device=device) for p in global_model.parameters()]
@@ -399,13 +335,8 @@ def federated_training(
             n_train = int(0.8 * n)
 
             train_global_idxs = device_full_indices[:n_train].tolist()
-            cifar_train_transform = datasets.CIFAR10(
-                root=args.data_dir,
-                train=True,
-                download=False,
-                transform=transform_train
-            )
-            train_subset = Subset(cifar_train_transform, train_global_idxs)
+            base_dataset = device_loaders[dev_id].dataset.dataset
+            train_subset = Subset(base_dataset, train_global_idxs)
             train_loader = DataLoader(
                 train_subset,
                 batch_size=args.local_batch_size,
@@ -524,12 +455,9 @@ def federated_training(
             if rounds_no_improve >= args.early_stopping_patience:
                 print(f"Early stopping at round {rnd}. Best: {best_rnd} ({best_test_acc:.4%})")
                 break
-
-        torch.cuda.empty_cache()
         if (time.time() - training_start) >= max_duration:
             print("⏱️ Time limit reached, stopping.")
             break
-
     return history, best_global_model_state
 
 

@@ -3,7 +3,6 @@ import os
 import copy
 import math
 import time
-import warnings
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -16,6 +15,7 @@ from torchvision import datasets, transforms
 from sklearn.cluster import kmeans_plusplus
 
 from src.codebooks import make_perm_popularity, make_perm_spectral
+from src.datasets import load_cifar_datasets
 from src.models import _model_factory_from_args
 from src.federated import update_model_inplace
 from src.paths import _norm_order_tag, make_dataset_slug
@@ -24,6 +24,7 @@ from src.analysis import (
     analyze_dataset, 
     plot_dataset_collection_history, 
     plot_codebook_ordering, 
+    save_pi_minimal_artifacts,
     compute_pi_distribution,
     compute_bits_per_dimension, 
     compute_ul_overhead, 
@@ -117,88 +118,6 @@ class TargetDatasetCollector:
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
         torch.save(bundle, self.out_path)
         print(f"[dataset] Saved bundle with {len(self.K_rounds)} rounds → {self.out_path}")
-
-
-def load_cifar_datasets(
-    data_dir: str,
-    num_devices: int = 100,
-    frac_random: float = 0.2,
-    batch_size_train: int = 32,
-    batch_size_test: int = 128,
-    shuffle_train: bool = True,
-):
-    # 0) Define exactly the AirComp transformation pipelines
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-
-    # 1) Load full CIFAR10 via torchvision (handles download & pickles)
-    full_train = datasets.CIFAR10(
-        root=data_dir,
-        train=True,
-        download=True,
-        transform=transform_train
-    )
-    full_test = datasets.CIFAR10(
-        root=data_dir,
-        train=False,
-        download=True,
-        transform=transform_test
-    )
-
-    # 2) Build the same non‑IID index splits (rand + global‑sort shard)
-    N = len(full_train)  # 50000
-    local_per_dev = N // num_devices
-    rand_per_dev = int(local_per_dev * frac_random)
-    shard_size = local_per_dev - rand_per_dev
-
-    if N % num_devices != 0:
-        warnings.warn(f"{N} not divisible by {num_devices}, dropping {N%num_devices}")
-
-    # 2a) shuffle all indices, carve off the random chunk & reshape
-    all_idxs = np.arange(N)
-    np.random.shuffle(all_idxs)
-    rand_idxs = all_idxs[: num_devices * rand_per_dev]
-    rem_idxs = all_idxs[num_devices * rand_per_dev :]
-    rand_blocks = rand_idxs.reshape(num_devices, rand_per_dev)
-
-    # 2b) global sort of the remainder by label → shard_blocks
-    rem_labels = np.array(full_train.targets)[rem_idxs]
-    sorted_rem = rem_idxs[np.argsort(rem_labels)]
-    shards = sorted_rem[: num_devices * shard_size]
-    shard_blocks = shards.reshape(num_devices, shard_size)
-
-    # 3) Create one DataLoader per device via Subset(full_train, idxs)
-    device_loaders = []
-    for dev in range(num_devices):
-        idxs = np.concatenate([rand_blocks[dev], shard_blocks[dev]])
-        subset = Subset(full_train, idxs.tolist())
-
-        loader = DataLoader(
-            subset,
-            batch_size=batch_size_train,
-            shuffle=shuffle_train,
-            num_workers=2,
-            pin_memory=True
-        )
-        device_loaders.append(loader)
-
-    # 4) Single global test loader
-    test_loader = DataLoader(
-        full_test,
-        batch_size=batch_size_test,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-    return device_loaders, test_loader
 
 
 def quantize(splits_flat, args, L, Q_codebook, batch_size=256):
@@ -517,11 +436,7 @@ if __name__ == "__main__":
     parser.add_argument('--train-size',       type=int,   default=400,help="number of training samples")
     parser.add_argument('--valid-size',       type=int,   default=100,help="number of validation samples")
     parser.add_argument('--test-size',        type=int,   default=100,help="number of test samples")
-    parser.add_argument('--pt-epochs',        type=int,   default=5,help="pretraining epochs")
-    parser.add_argument('--pt-batch-size',    type=int,   default=16,help="training batch size")
-    parser.add_argument('--pt-patience',      type=int,   default=5,help="early-stop patience")
-    parser.add_argument('--sched-patience',   type=int,   default=5, help="scheduler patience")
-    parser.add_argument('--sched-factor',     type=float, default=0.5, help="scheduler factor")
+    parser.add_argument('--early-stopping-patience', type=int, default=20, help="early stopping patience")
     parser.add_argument('--code-order',       type=str,   default="pop", choices=["none", "spectral", "spectral_pop", "pop"], help="codebook ordering strategy")
 
     # === Dataset Parameters ===
@@ -536,7 +451,6 @@ if __name__ == "__main__":
     parser.add_argument('--max-p',            type=int, default=2, help="maximum participants per round")
     parser.add_argument('--total-rounds',     type=int, default=5, help="total number of global rounds")
     parser.add_argument('--local-epochs',     type=int, default=3, help="number of local epochs per round")
-    parser.add_argument('--local-batch-size', type=int, default=20, help="local training batch size")
     parser.add_argument('--local-lr',         type=float, default=0.01, help="local learning rate")
     
     # === Global Optimizer Parameters ===
@@ -551,26 +465,6 @@ if __name__ == "__main__":
     parser.add_argument('--message-split',    type=int, default=10, help="message split size & quantization dimension")
     parser.add_argument('--n',                type=int, default=256, help="number of codewords in codebooks")
     parser.add_argument('--dim',              type=int, default=64, help="encoding dimension")
-    parser.add_argument('--snr-db',           type=float, default=20, help="signal-to-noise ratio in dB")
-    parser.add_argument('--temperature',      type=float, default=0.01, help="temperature for soft quantization")
-    parser.add_argument('--quant-trainable',  action='store_false', help="make quantization codebook trainable")
-    parser.add_argument('--post-rounding',    action='store_true', help="apply post-rounding")
-    parser.add_argument('--grad-accumulation-size', type=int, default=128, help="gradient accumulation size for decoding")
-    
-    # === ISTANet Parameters ===
-    parser.add_argument('--num-layers',       type=int, default=10, help="number of ISTANet layers")
-    parser.add_argument('--num-filters',      type=int, default=32, help="number of filters in ISTANet")
-    parser.add_argument('--kernel-size',      type=int, default=3, help="kernel size in ISTANet")
-    
-    # === Compressor Training Parameters ===
-    parser.add_argument('--amp-lr',          type=float, default=0.0001, help="compressor learning rate")
-    parser.add_argument('--lambda-sparse',    type=float, default=0.001, help="sparsity regularization weight")
-    parser.add_argument('--lambda-w',         type=float, default=0.001, help="W matrix regularization weight")
-    
-    # === Training Control Parameters ===
-    parser.add_argument('--early-stopping-patience', type=int, default=20, help="early stopping patience")
-    parser.add_argument('--scheduler-patience', type=int, default=10, help="LR scheduler patience")
-    parser.add_argument('--scheduler-factor', type=float, default=0.5, help="LR scheduler reduction factor")
 
     # === Model Selection ===
     parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'custom'], help="which global model to use for data collection")
@@ -605,12 +499,10 @@ if __name__ == "__main__":
         batch_size_train=args.batch_size_train,
         batch_size_test=args.batch_size_test
     )
-    # global_model = ResNetSimple().to(args.device)
     make_model, model_tag, model_clsname = _model_factory_from_args(args)
     args.model_tag = model_tag
     args.model_classname = model_clsname
     global_model = make_model().to(args.device)
-
     torch.cuda.empty_cache()
 
     # Run federated training
@@ -622,9 +514,10 @@ if __name__ == "__main__":
         device=args.device,
         make_model=make_model,
     )
+    save_pi_minimal_artifacts(dataset_path, args, base_name="pi_rounds_min")
 
     # Print accuracy curve & dataset analysis
     plot_dataset_collection_history(history, os.path.join(args.save_dir, "history_plots"))
     analysis_dir = os.path.join(args.save_dir, 'analysis')
-    analyze_dataset(path=dataset_path, args=args, rounds_to_plot=None, save_dir=analysis_dir)
+    analyze_dataset(path=dataset_path, rounds_to_plot=None, save_dir=analysis_dir)
 
