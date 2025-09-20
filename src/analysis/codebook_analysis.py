@@ -1,4 +1,5 @@
 
+import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -13,7 +14,8 @@ def visualise_codebook_heatmap(C, title="Codebook Heatmap", save_path=None):
     plt.ylabel("Codebook Rows")
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -145,7 +147,8 @@ def analyse_codebook(C, plot=True, k_rip=None, save_path=None, show_plots=True):
         plt.tight_layout()
         metrics['plots'] = fig
         if save_path:
-            plt.savefig(save_path)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
         if show_plots:
             plt.show()
     

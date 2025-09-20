@@ -27,8 +27,12 @@ class SimAMPNetLossWithSparsity(nn.Module):
             w_reg = torch.norm(model.W.conj().T @ model.W - I, p='fro') ** 2
 
         # K loss
-        K_a_t      = torch.as_tensor(float(K_a), device=x_pred.device, dtype=x_pred.dtype)
-        K_final_t  = torch.as_tensor(float(K_final), device=x_pred.device, dtype=x_pred.dtype)
-        k_loss = F.mse_loss(K_final_t, K_a_t, reduction='mean')
+        K_a_t     = torch.as_tensor(K_a, device=x_pred.device, dtype=x_pred.dtype)
+        K_final_t = torch.as_tensor(K_final, device=x_pred.device, dtype=x_pred.dtype)
+        if K_a_t.ndim == 0:
+            K_pred_b = K_final_t
+        else:
+            K_pred_b = K_final_t.view(1).expand_as(K_a_t)
+        k_loss = F.mse_loss(K_pred_b, K_a_t.detach(), reduction='mean')
 
         return rec_loss + self.lambda_sparse * sparsity + self.lambda_w * w_reg + self.lambda_k * k_loss

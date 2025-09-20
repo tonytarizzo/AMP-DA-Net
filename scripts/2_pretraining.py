@@ -30,6 +30,7 @@ from src.decoding import (
 from src.paths import (
     load_ifed_from_args, 
     save_pretrained_artifacts,
+    _sha1_tensor,
 )
 from src.utils import (
     compute_nmse,
@@ -52,9 +53,7 @@ from src.analysis import (
     save_json,
     append_jsonl,
     run_manifest,
-    _sha1_tensor,
     _triplet_to_dict,
-    save_codebook_analysis_artifacts,
 )
 
 
@@ -236,7 +235,6 @@ def save_codebook_analysis_artifacts(metrics, args, *, codebook_pt_path: str | N
       - <save_dir>/summaries/codebook_analysis.json        (scalars + meta)
       - <save_dir>/summaries/codebook_analysis_arrays.npz  (arrays)
     """
-    import numpy as np
     summ_dir = os.path.join(args.save_dir, "summaries")
     os.makedirs(summ_dir, exist_ok=True)
 
@@ -742,7 +740,9 @@ def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_es
                 # AMP-DA
                 x_ampda_np = None
                 try:
-                    x_ampda_b, stats = amp_da(z_ampda_np, A_ampda, device=args.device)
+                    y_t = torch.from_numpy(z_ampda_np).to(device=args.device, dtype=A_ampda.dtype)
+                    C_t = A_ampda.to(device=args.device, dtype=y_t.dtype)
+                    x_ampda_b, stats = amp_da(y_t, C_t, device=args.device)
                     x_ampda_np = x_ampda_b.detach().cpu().numpy()
                     k_est = float(stats["K_count_per_split"].mean().item())
                     k_int = int(round(k_est))

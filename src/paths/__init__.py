@@ -14,4 +14,5 @@ from .pretrain_handling import (
     save_pretrained_artifacts,
     load_paired_decoder,
     load_pretrained_pair,
+    _sha1_tensor,
 )
