@@ -39,9 +39,13 @@ The paths for collected datasets and pretrained encoder-decoder pairs are automa
 If you use this code in your work, please cite (although it is not yet an official cite, will be added to arXiv soon!):
 
 ```
-@article{tarizzo2025ampdanet,
-  title   = {Learned Digital Codes for Over-the-Air Federated Learning},
-  author  = {Antonio Tarizzo, Mohammad Kazemi, Deniz Gündüz},
-  year    = {2025}
+@article{tarizzo2025learneddigitalcodesovertheair,
+      title={Learned Digital Codes for Over-the-Air Federated Learning}, 
+      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
+      year={2025},
+      eprint={2509.16577},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.16577}, 
 }
 ```
