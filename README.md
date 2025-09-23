@@ -36,7 +36,7 @@ The paths for collected datasets and pretrained encoder-decoder pairs are automa
 
 ## Citation
 
-If you use this code in your work, please cite (although it is not yet an official cite, will be added to arXiv soon!):
+If you use this code in your work, please cite:
 
 ```
 @article{tarizzo2025learneddigitalcodesovertheair,
