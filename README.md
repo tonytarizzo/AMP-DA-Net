@@ -1,6 +1,6 @@
 # AMP-DA-Net
 
-Supporting code for **“Learned Digital Codes for Over-the-Air Federated Learning” (2025)**.  
+Supporting code for **“Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning” (2025)**.  
 This repo contains three end-to-end stages:
 
 1) **Dataset collection** (simulate FL + wireless compression, save iFed bundles)  
@@ -39,6 +39,21 @@ The paths for collected datasets and pretrained encoder-decoder pairs are automa
 If you use this code in your work, please cite:
 
 ```
+@article{tarizzo2025learneddigitalotacomputation,
+      title={Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning},
+      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
+      year={2025},
+      archivePrefix={arXiv},
+      eprint={2512.19777},
+      doi={10.48550/arXiv.2512.19777},
+      url={https://arxiv.org/abs/2512.19777},
+      note={Submitted to IEEE Journal on Selected Areas in Communications 2026}
+}
+```
+
+Or for the earlier conference version:
+
+```
 @article{tarizzo2025learneddigitalcodesovertheair,
       title={Learned Digital Codes for Over-the-Air Federated Learning}, 
       author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
@@ -46,6 +61,7 @@ If you use this code in your work, please cite:
       eprint={2509.16577},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2509.16577}, 
+      url={https://arxiv.org/abs/2509.16577},
+      note={Submitted to IEEE International Conference on Acoustics, Speech, and Signal Processing 2026}
 }
 ```
