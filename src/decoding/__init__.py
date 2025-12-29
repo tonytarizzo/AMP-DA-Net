@@ -1,6 +1,5 @@
 
 from .greedy import (
-    omp,
     ista,
     amp_da,
 )

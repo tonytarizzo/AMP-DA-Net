@@ -13,10 +13,8 @@ from .metrics import (
 )
 from .parameter_estimation import (
     compute_pi_distribution,
-    pi_from_indices,
 )
 from .codebook_analysis import (
-    visualise_codebook_heatmap,
     analyse_codebook,
     print_codebook_analysis,
 )

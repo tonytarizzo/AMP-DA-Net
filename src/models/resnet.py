@@ -74,3 +74,41 @@ class ResNetSimple(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
+
+
+class SmallVGG(nn.Module):
+    """
+    Compact VGG-style CNN for CIFAR-10.
+    Param count ~288k with widths=(32, 64, 128).
+    """
+    def __init__(self, widths=(32, 64, 128), num_classes=10):
+        super().__init__()
+        w1, w2, w3 = widths
+        
+        self.features = nn.Sequential(
+            # Block 1: 32x32 -> 16x16
+            nn.Conv2d(3, w1, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(w1, w1, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            # Block 2: 16x16 -> 8x8
+            nn.Conv2d(w1, w2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(w2, w2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            # Block 3: 8x8 -> 1x1
+            nn.Conv2d(w2, w3, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(w3, w3, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Linear(w3, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)          # (B, w3, 1, 1)
+        x = x.view(x.size(0), -1)     # (B, w3)
+        x = self.classifier(x)        # (B, num_classes)
+        return x

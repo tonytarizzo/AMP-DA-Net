@@ -1,4 +1,3 @@
-
 import os
 import copy
 import math
@@ -12,237 +11,248 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-from sklearn.cluster import kmeans_plusplus
 
-from src.codebooks import make_perm_popularity, make_perm_spectral
 from src.datasets import load_cifar_datasets
 from src.models import _model_factory_from_args
 from src.federated import update_model_inplace
-from src.paths import _norm_order_tag, make_dataset_slug
+from src.paths import make_raw_dataset_slug, _fmt_float
 from src.utils import EarlyStopNaN, _ensure_finite
-from src.analysis import (
-    analyze_dataset, 
-    plot_dataset_collection_history, 
-    plot_codebook_ordering, 
-    save_pi_minimal_artifacts,
-    compute_pi_distribution,
-    compute_bits_per_dimension, 
-    compute_ul_overhead, 
-    error_feedback_info
-)
+from src.analysis import plot_dataset_collection_history
 
 
 class TargetDatasetCollector:
-    """ Currently saves:
-        Target indices per split: X
-        Per-round Kₐ: K_rounds
-        Per-round true π: pi_targets
-        Per-round estimated π: pi_estimates
-        BS one-hot index vectors per split: device_idx
-        Number of splits per round (S): round_len
-
-        Now also saves:
-        - meta: dict with dataset generation knobs (n, dim, message_split, code_order, K_t, p-range, frac_random, seed)
-        - filename derived from a deterministic slug that encodes those knobs
     """
-    def __init__(self, args, save_root: str | None = None):
-        self.X_list = []
-        self.K_rounds = []
-        self.pi_targets = []
-        self.pi_estimates = []
-        self.device_idx_list = []
-        self.round_len = None
+    Collector that stores per-device raw updates (split into L-sized blocks).
+    Quotas (train/valid/test sizes) are interpreted as number of future sparse vectors/fragments.
+    """
+    def __init__(self, args, save_root: str = "datasets/iFed_datasets",
+                 train_round_ids=None, valid_round_ids=None, test_round_ids=None):
+        self.args = args
+        self.L = int(args.message_split)
+        self.D = int(args.model_num_params)
 
-        # meta captured once
-        order_tag = _norm_order_tag(args.code_order)
+        self.frag_quota = {"train": int(args.train_size), "valid": int(args.valid_size), "test": int(args.test_size)}
+        self.frag_remaining = self.frag_quota.copy()
+        
+        # buffers: flat rows and per-fragment descriptors
+        self.buf = {"train": [], "valid": [], "test": []}     # list of (N_i, L) tensors
+        self.frags = {"train": [], "valid": [], "test": []}   # list of dicts with metadata
+
+        # per-round constants/meta
+        self.S = math.ceil(self.D / self.L)  # blocks per device per round
+        self.mode = str(getattr(args, "within_round", "prefix")).lower()
+        assert self.mode in {"prefix", "contig_rand", "random"}, "Invalid within_round mode."
+
+        # round-id splits (0-based)
+        self.round_ids = {"train": list(train_round_ids or []), "valid": list(valid_round_ids or []), "test": list(test_round_ids or [])}
+        self.K_rounds = []  # Records one K_a per round
+        self.bs_local_blocks = {}  # Records local base station training raw values
+
+        # slug/meta/output path
         model_tag = getattr(args, 'model_tag', 'resnet')
+        slug = make_raw_dataset_slug(
+            model=model_tag, D=self.D, L=self.L,
+            Kt=int(args.K_t), pmin=int(args.min_p), pmax=int(args.max_p),
+            frac_random=float(args.frac_random), seed=int(args.seed)
+        )
+        os.makedirs(save_root, exist_ok=True)
+        self.out_path = os.path.join(save_root, f"{slug}.pth")
         self.meta = {
-            "kind": "ifed_sparse_vectors",
-            "version": 1,
+            "kind": "ifed_raw_per_device",
+            "version": 2,
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            # model info
             "model": model_tag,
             "model_class": getattr(args, 'model_classname', None),
-            "model_num_params": getattr(args, 'model_num_params', None),
-            # hard-compat knobs
-            "n": int(args.n),
-            "dim": int(args.dim),
-            "message_split": int(args.message_split),
-            "code_order": order_tag,                   # "pop" | "spectral" | "spectral+pop" | "none"
-            # generation context
+            "model_num_params": self.D,
+            "message_split": self.L,
             "K_t": int(args.K_t),
             "min_p": int(args.min_p),
             "max_p": int(args.max_p),
             "frac_random": float(args.frac_random),
             "seed": int(args.seed),
+            "round_ids": self.round_ids,
         }
+        self.row_dtype = None
+        print(f"[dataset] Will save → {self.out_path}  | L={self.L}  | S(per-device)={self.S}")
 
-        slug = make_dataset_slug(
-            model=model_tag,
-            order=order_tag, n=self.meta["n"], dim=self.meta["dim"],
-            msg=self.meta["message_split"], Kt=self.meta["K_t"],
-            pmin=self.meta["min_p"], pmax=self.meta["max_p"],
-            frac_random=self.meta["frac_random"], seed=self.meta["seed"]
-        )
+    def _pick_split_for_round(self, r0: int) -> str:
+        if r0 in self.round_ids["test"]:
+            return "test"
+        if r0 in self.round_ids["valid"]:
+            return "valid"
+        return "train"
+    
+    def _rounds_left_in_split(self, split: str, r0: int) -> int:
+        ids = self.round_ids[split]
+        return sum(1 for x in ids if x >= r0)
 
-        base = save_root or os.path.join(args.data_dir, "iFed_datasets")
-        os.makedirs(base, exist_ok=True)
-        self.out_path = os.path.join(base, f"{slug}.pth")
-        print(f"[dataset] Will save to: {self.out_path}")
+    def _select_positions(self, S: int, k: int, rnd_seed: int) -> torch.Tensor:
+        """Choose k fragment positions in [0..S-1] according to mode."""
+        k = max(0, min(int(k), S))
+        if k == 0:
+            return torch.empty(0, dtype=torch.long)
+        device = torch.device("cpu")
+        g = torch.Generator(device=device).manual_seed(self.args.seed + 97 * rnd_seed)
+        if self.mode == "prefix":
+            return torch.arange(0, k, dtype=torch.long)
+        if self.mode == "contig_rand":
+            max_start = max(0, S - k)
+            start = 0 if max_start == 0 else int(torch.randint(0, max_start + 1, (1,), generator=g).item())
+            return torch.arange(start, start + k, dtype=torch.long)
+        # random
+        return torch.randperm(S, generator=g)[:k]
 
-    def add(self, target_vectors, K_a, pi_target, pi_estimate, device_idx_round):
-        self.X_list.append(target_vectors.detach().cpu())
-        self.K_rounds.append(int(K_a))
-        self.pi_targets.append(pi_target.detach().cpu())
-        self.pi_estimates.append(pi_estimate.detach().cpu())
-        self.device_idx_list.append(device_idx_round.detach().cpu())
-        if self.round_len is None:
-            self.round_len = int(target_vectors.shape[0])
+    @torch.no_grad()
+    def add_bs_local(self, bs_delta_D: torch.Tensor, r1_based: int):
+        """
+        Record base station local training delta for this round.
+        Input:
+            bs_delta_D: (D,) or (1, D) float tensor on any device.
+        Saves (S, L) blocks after zero-padding the tail to multiple of L.
+        """
+        r0 = int(r1_based) - 1
+        bs_delta_D = bs_delta_D.view(-1).to(dtype=self.row_dtype or bs_delta_D.dtype)
+        assert bs_delta_D.numel() == self.D, f"BS delta length {bs_delta_D.numel()} != D={self.D}"
 
-    def save(self):
-        X = torch.cat(self.X_list, dim=0) if self.X_list else torch.empty((0,0))
-        K_rounds = torch.tensor(self.K_rounds, dtype=torch.long)
-        pi_targets = torch.stack(self.pi_targets, dim=0) if self.pi_targets else torch.empty((0,0))
-        pi_estimates = torch.stack(self.pi_estimates, dim=0) if self.pi_estimates else torch.empty((0,0))
-        device_idx = torch.cat(self.device_idx_list, dim=0) if self.device_idx_list else torch.empty((0,), dtype=torch.long)
+        pad = (-self.D) % self.L
+        if pad > 0:
+            bs_delta_D = torch.cat([bs_delta_D, bs_delta_D.new_zeros(pad)], dim=0)
+
+        blocks = bs_delta_D.view(self.S, self.L).contiguous().cpu()  # (S, L)
+        self.bs_local_blocks[r0] = blocks
+
+    @torch.no_grad()
+    def add_round_devices(self, deltas_Ka_D: torch.Tensor, K_a: int, r1_based: int):
+        """
+        Select fragment positions ONCE for this round and append *per fragment* exactly K_a rows (one per device). 
+        Quotas are in fragments, so we allocate a balanced number of fragments per remaining round in the split.
+        """
+        assert deltas_Ka_D.dim() == 2 and deltas_Ka_D.size(1) == self.D, "deltas must be (K_a, D)"
+        K_a = int(K_a)
+        r0 = r1_based - 1
+        self.K_rounds.append(K_a)  # record K_a per round
+        if self.row_dtype is None:
+            self.row_dtype = deltas_Ka_D.dtype
+
+        # reshape to (K_a, S, L)
+        pad = (-self.D) % self.L
+        if pad > 0:
+            pad_zeros = deltas_Ka_D.new_zeros((K_a, pad))
+            deltas_Ka_D = torch.cat([deltas_Ka_D, pad_zeros], dim=1)
+        dev_blocks = deltas_Ka_D.view(K_a, self.S, self.L)  # (K_a, S, L)
+
+        split = self._pick_split_for_round(r0)
+        rounds_left = self._rounds_left_in_split(split, r0)
+        if rounds_left <= 0 or self.frag_remaining[split] <= 0:
+            return
+
+        # balanced per-round allocation measured in fragments
+        target_frags_this_round = math.ceil(self.frag_remaining[split] / rounds_left)
+        k_positions = min(self.S, target_frags_this_round)
+        if k_positions <= 0:
+            return
+    
+        pos = self._select_positions(self.S, k_positions, rnd_seed=r1_based)
+        if pos.numel() == 0:
+            return
+
+        rows_to_cat = []
+        frag_descs = []
+        running_offset = sum(t.size(0) for t in self.buf[split])  # current flat length in rows
+
+        for p in pos.tolist():
+            # (K_a, L) for this fragment index p
+            frag_rows = dev_blocks[:, p, :].contiguous().cpu()
+            start = running_offset
+            end = start + K_a
+            rows_to_cat.append(frag_rows)
+            frag_descs.append({
+                "round": r0,          # 0-based round id
+                "pos": int(p),        # fragment index within the round
+                "K_a": K_a,           # active devices this round
+                "rows": [start, end]  # [start, end) in the flat X
+            })
+            running_offset = end
+
+        if rows_to_cat:
+            self.buf[split].append(torch.vstack(rows_to_cat))
+            self.frags[split].extend(frag_descs)
+            self.frag_remaining[split] -= pos.numel()
+
+        print(f"[collect r={r1_based:03d}] split={split} took_frags={pos.numel()} "
+              f"(each → K_a={K_a} rows). remaining_frags(train/valid/test)="
+              f"{self.frag_remaining['train']}/{self.frag_remaining['valid']}/{self.frag_remaining['test']}")
+
+    def finalize_and_save(self):
+        """Save flat rows plus fragment descriptors and K_rounds."""
+        def _cat_or_empty(lst):
+            dtype = self.row_dtype or torch.float32
+            return torch.vstack(lst) if lst else torch.empty((0, self.L), dtype=dtype)
+
+        train_X = _cat_or_empty(self.buf["train"])
+        valid_X = _cat_or_empty(self.buf["valid"])
+        test_X = _cat_or_empty(self.buf["test"])
+
+        for k in ("train", "valid", "test"):
+            if self.frag_remaining[k] > 0:
+                print(f"[warn] fragment quota for {k} underfilled by {self.frag_remaining[k]} fragments.")
 
         bundle = {
-            'X': X,
-            'K_rounds': K_rounds,
-            'pi_targets': pi_targets,
-            'pi_estimates': pi_estimates,
-            'device_idx': device_idx,
-            'round_len': self.round_len,
-            'meta': self.meta,
+            "meta": self.meta,
+            "D": self.D,
+            "L": self.L,
+            "S_per_device": self.S,
+            "K_rounds": torch.tensor(self.K_rounds, dtype=torch.long),  # (R,)
+            "splits": {
+                "train": {"X": train_X, "frags": self.frags["train"]},
+                "valid": {"X": valid_X, "frags": self.frags["valid"]},
+                "test": {"X": test_X, "frags": self.frags["test"]},
+            },
+            "bs_local": self.bs_local_blocks
         }
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
         torch.save(bundle, self.out_path)
-        print(f"[dataset] Saved bundle with {len(self.K_rounds)} rounds → {self.out_path}")
+        print(f"[dataset] Saved per-device (flat) bundle → {self.out_path}")
+        return self.out_path
 
 
-def quantize(splits_flat, args, L, Q_codebook, batch_size=256):
-    """Memory-efficient batched quantization"""
-    total_splits = splits_flat.shape[0]
-    indices_list = torch.empty(total_splits, dtype=torch.long, device=args.device)
-    quant_words_list = torch.empty(total_splits, L, device=args.device)
-    for start_idx in range(0, total_splits, batch_size):
-        end_idx = min(start_idx + batch_size, total_splits)
-        batch_splits = splits_flat[start_idx:end_idx]
-        dists = torch.cdist(batch_splits, Q_codebook, p=2)
-        indices = torch.argmin(dists, dim=1)
-        quant_words = Q_codebook[indices]
-        quant_words_list[start_idx:end_idx] = quant_words
-        indices_list[start_idx:end_idx] = indices
-    return indices_list, quant_words_list
-
-
-def quantize_process(deltas_w_feedback, args, K_a, dataset_collector):
-    """ Quantizes the deltas with feedback and updates the error feedback."""
-    # 0) Initialistaion
-    K_a, D = deltas_w_feedback.shape
-    S, L = args.num_splits, args.message_split
-
-    # 1) Calculate k-means quantisation codebook
-    bs_mini_dataset = deltas_w_feedback[0]
-    pad = (-bs_mini_dataset.numel()) % L
-    if pad > 0:
-        bs_mini_dataset = torch.cat([bs_mini_dataset, bs_mini_dataset.new_zeros(pad)])
-    bs_blocks = bs_mini_dataset.view(-1, L).cpu().numpy()
-
-    # Additional Guard for Nans produced during training
-    if not np.isfinite(bs_blocks).all():
-        raise EarlyStopNaN("mini-dataset blocks (bs_blocks) contain NaN/Inf before k-means.")
-    
-    centers, _ = kmeans_plusplus(bs_blocks, n_clusters=args.n, random_state=0)
-    new_Q = torch.tensor(centers, device=args.device)
-
-    # 2) Estimate pi distribution
-    mini = torch.from_numpy(bs_blocks).to(args.device)
-    dists_mini = torch.cdist(mini, new_Q, p=2) 
-    idx_mini = torch.argmin(dists_mini, dim=1)
-    pi_est = torch.bincount(idx_mini, minlength=args.n).float()
-    pi_est /= (pi_est.sum() + 1e-12)
-
-    # 2.5) Re-order quantisation codebook, idx_mini & pi distribution
-    # Q_before  = new_Q.detach().clone()
-    # pi_before = pi_est.detach().clone()
-    # idx_before = idx_mini.detach().clone()
-    if str(args.code_order).lower() == "none":
-        args.code_order = None
-    if args.code_order is not None:
-        if args.code_order == "pop":
-            perm, inv_perm = make_perm_popularity(pi_est)
-        elif args.code_order == "spectral":
-            perm, inv_perm = make_perm_spectral(new_Q, idx_mini=idx_mini, pi_est=None, blend_pop=0.0)
-        elif args.code_order == "spectral_pop":
-            perm, inv_perm = make_perm_spectral(new_Q, idx_mini=idx_mini, pi_est=pi_est, blend_pop=1.0)
-        else:
-            raise ValueError(f"Unknown code order: {args.code_order}")
-        new_Q = new_Q[perm]              # reorder codewords
-        pi_est = pi_est[perm]            # reorder popularity to match
-        idx_mini = inv_perm[idx_mini]    # remap old assignments to new ids
-        # round_idx = len(dataset_collector.K_rounds) + 1
-        # b0, b1 = plot_codebook_ordering(Q_before, pi_before, idx_before, perm, args, tag=f"round{round_idx:03d}")
-        # print(f"[code-order] bandedness: {b0:.3f} → {b1:.3f} (Δ={b1-b0:+.3f})")
-
-    # 3) Message splitting, padding and reshaping
-    pad = (-D) % L
-    if pad > 0:
-        padding = torch.zeros((K_a, pad), device=args.device, dtype=deltas_w_feedback.dtype)
-        deltas_w_feedback = torch.cat([deltas_w_feedback, padding], dim=1)
-    deltas_flat = deltas_w_feedback.view(-1, L) # (K_a * S, L)
-
-    # 4) Quantize, aggregate & update error feedback
-    indices_list, quant_words = quantize(deltas_flat, args, L, new_Q, batch_size=256)
-
-    # 5) Create target sparse vectors
-    idx_mat = indices_list.view(K_a, S)  # (K_a, S)
-    target_vectors = F.one_hot(idx_mat, num_classes=args.n).sum(dim=0).float()
-    pi_target = compute_pi_distribution(target_vectors)  # (n,)
-
-    device_idx_round = idx_mini.to(torch.long)  # (S,)
-    if device_idx_round.numel() != target_vectors.shape[0]:  # Padding guard for shape mismatch
-        device_idx_round = device_idx_round[:target_vectors.shape[0]]
-    dataset_collector.add(target_vectors, K_a, pi_target, pi_est, device_idx_round)
-    dataset_collector.save()
-
-    new_err_flat = deltas_flat - quant_words # (K_a * S, L)
-    print("Quantization, encoding & dataset saving done")
-    if not torch.isfinite(new_err_flat).all():
-        raise EarlyStopNaN("new_err_flat contains NaN/Inf after quantization.")
-
-    # 4) Remove padding & reshape quantisation error updates
-    new_errors = new_err_flat.view(K_a, -1)[:, :D] # (K_a, D)
-    quant_words = quant_words.view(K_a, S, L)  # per‑device splits
-    rec_per_dev = quant_words.reshape(K_a, -1)[:, :D]  # drop padding, back to (K_a, D)
-    recovered_update = rec_per_dev.sum(dim=0)
-    return recovered_update, new_errors
+def split_round_ids(R, args):
+    """Split round IDs into train/valid/test sets based on seed."""
+    g = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(R, generator=g).tolist()
+    n_test = min(max(int(getattr(args, "num_test_rounds", 0)), 0), max(R - 1, 0))
+    test_round_ids = perm[:n_test]
+    remaining_rounds = [r for r in range(R) if r not in test_round_ids]
+    n_valid_rounds = max(1, min(len(remaining_rounds)-1, int(0.10 * len(remaining_rounds)))) if len(remaining_rounds) > 1 else 0
+    valid_round_ids = remaining_rounds[:n_valid_rounds]
+    train_round_ids = remaining_rounds[n_valid_rounds:] if n_valid_rounds > 0 else remaining_rounds
+    return train_round_ids, valid_round_ids, test_round_ids
 
 
 def federated_training(global_model, device_loaders, test_loader, args, device, make_model):
     """
-    Federated learning with wireless channel compression using ISTANet
-    Args:
-        global_model: the ResNet model
-        device_loaders: list of DataLoaders, one per device with on-fly transformations
-        test_loader: DataLoader for CIFAR-10 test set
-        args: parsed arguments containing all hyperparameters
-        device: torch device (cuda/cpu)
+    Federated learning without quantisation.
+    Collector saves per-device updates sliced to (K_a, S, L) fragments (train/valid/test)
+    Also saves base station local training delta per round, reshaped to (S, L) under 'bs_local'
     """
-    # 0) Start timer and dispaly setup info
+    # 0) Start timer and display setup info
     training_start = time.time()
     max_duration = 23 * 3600
 
     D = sum(p.numel() for p in global_model.parameters())
-    args.model_num_params = int(D)  # so the collector can embed it
-    args.num_splits = math.ceil(D / args.message_split)  # Number of message-splits per device
+    args.model_num_params = int(D)
     print(f"Global model has {D} parameters.")
-    UL_overhead = compute_ul_overhead(D, args.message_split, args.dim, P=1024, complex=False)
-    print(f"UL communication overhead: {UL_overhead} time slots per round")
-    bpd = compute_bits_per_dimension(args.n, args.message_split)
-    print(f"Bits per dimension: {bpd:.3f} bits/dim")
 
-    # 1) Define transforms for train/test splits
+    # 1) Prepare dataset collector and round splits
+    R_planned = int(args.total_rounds)
+    tr_ids, va_ids, te_ids = split_round_ids(R_planned, args)
+    dataset_collector = TargetDatasetCollector(
+        args=args, save_root=os.path.join(args.data_dir, "iFed_datasets"),
+        train_round_ids=tr_ids, valid_round_ids=va_ids, test_round_ids=te_ids
+    )
+    device_participation_count = [0] * args.K_t
+
+    # 2) Define transforms for train/test splits
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -250,36 +260,28 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
 
-    # 2) Initialize optimizers, error feedback and history
+    # 3) Initialize optimizers, error feedback and history
     momentum_buffer_list = [torch.zeros_like(p.data, device=device) for p in global_model.parameters()]
     exp_avgs = [torch.zeros_like(p.data, device=device) for p in global_model.parameters()]
     exp_avg_sqs = [torch.zeros_like(p.data, device=device) for p in global_model.parameters()]
 
-    dataset_collector = TargetDatasetCollector(args=args)
-    device_participation_count = [0] * args.K_t
-    Q_errors = [torch.zeros((D,), device=device) for _ in range(args.K_t)]
-
     history = {'test_acc': []}
     best_test_acc = -float("inf")
     best_global_model_state = copy.deepcopy(global_model.state_dict())  # safe fallback
-    rounds_no_improve = 0
 
     # 4) Run global rounds
     for rnd in range(1, args.total_rounds + 1):
         global_state = global_model.state_dict()
-        par_before = [p.data.clone() for p in global_model.parameters()] # captures only the trainable parameters
+        par_before = [p.data.clone() for p in global_model.parameters()]
 
         # 4a) Sample participants
         K_a = np.random.randint(args.min_p, args.max_p + 1)
         participants = np.random.choice(args.K_t, K_a, replace=False)
-        participation_info = [f"{p}({device_participation_count[p]})" for p in participants]
-        print(f"Round {rnd} participants: {participation_info}")
+        print(f"Round {rnd} participants: {[f'{p}({device_participation_count[p]})' for p in participants]}")
 
         # 4b) Local training & delta collection
         local_state_dicts = []
-        local_losses = []
-
-        for i, dev_id in tqdm(enumerate(participants), desc=f"Round {rnd} — Local training", total=len(participants), ncols=80, leave=True):
+        for _, dev_id in tqdm(enumerate(participants), desc=f"Round {rnd} — Local training", total=len(participants), ncols=80, leave=True):
             device_participation_count[dev_id] += 1
             local_model = make_model().to(device)
             local_model.load_state_dict(global_state)
@@ -293,21 +295,9 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
             n_train = int(0.8 * n)
 
             train_global_idxs = device_full_indices[:n_train].tolist()
-            cifar_train_transform = datasets.CIFAR10(
-                root=args.data_dir,
-                train=True,
-                download=False,
-                transform=transform_train
-            )
-
+            cifar_train_transform = datasets.CIFAR10(root=args.data_dir, train=True, download=False, transform=transform_train)
             train_subset = Subset(cifar_train_transform, train_global_idxs)
-            train_loader = DataLoader(
-                train_subset,
-                batch_size=args.batch_size_train,
-                shuffle=True, 
-                num_workers=2, 
-                pin_memory=True
-            )
+            train_loader = DataLoader(train_subset, batch_size=args.batch_size_train, shuffle=True, num_workers=2, pin_memory=True)
 
             # 4d) Run local training
             local_model.train()
@@ -317,8 +307,7 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
                 for xb, yb in train_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     opt.zero_grad()
-                    logits = local_model(xb)
-                    loss = F.cross_entropy(logits, yb)
+                    loss = F.cross_entropy(local_model(xb), yb)
                     loss.backward()
                     opt.step()
 
@@ -329,7 +318,6 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
             if not math.isfinite(avg_loss):
                 raise EarlyStopNaN(f"Device {dev_id} produced non-finite average loss.")
             print(f"Device {dev_id} sample-weighted avg loss: {avg_loss:.4f}")
-            local_losses.append(avg_loss)
             local_state_dicts.append(local_model.state_dict())
             del local_model, opt
 
@@ -342,38 +330,21 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
             local_flat = torch.cat([local_state[name].view(-1) for name in param_names])
             local_deltas.append(local_flat - global_flat)
         deltas = torch.stack(local_deltas, dim=0)  # Shape: (K_a, D)
-
-        # 4f) Add quantisation error feedback
-        error_list = [Q_errors[dev_id].detach() for dev_id in participants]
-        error_matrix = torch.stack(error_list, dim=0)  # (K_a, D)
-        deltas_w_feedback = deltas + error_matrix
-        error_feedback_info(deltas, error_matrix)
-
-        # Guarding against NaNs
         _ensure_finite(deltas, "deltas")
-        _ensure_finite(error_matrix, "error_matrix")
-        _ensure_finite(deltas_w_feedback, "deltas_w_feedback")
 
-        try:
-            # 4g) Perfect aggregation of outputted deltas into one flat update
-            recovered_update, new_errors = quantize_process(deltas_w_feedback, args, K_a, dataset_collector)
-        except EarlyStopNaN as e:
-            print(f"[NaN-guard] {e} Stopping training early at round {rnd}.")
-            break
+        # 4f) Save per-device updates & local BS training to dataset collector
+        dataset_collector.add_bs_local(deltas[0], r1_based=rnd)
+        dataset_collector.add_round_devices(deltas, K_a, r1_based=rnd)
 
-        # 4h) Update quantisation errors per device
-        for i, dev_id in enumerate(participants): 
-            Q_errors[dev_id] = new_errors[i].detach()
-
-        # 4i) Average deltas across participants
+        # 4g) Average deltas across participants
+        avg_update_flat = deltas.mean(dim=0)        # (D,)
         avg_delta = []
-        pointer = 0
+        ptr = 0
         for p in par_before:
             n_param = p.numel()
-            slice_ = recovered_update[pointer:pointer+n_param].view(p.size())
-            avg_delta.append((slice_ / deltas.size(0)).detach())
-            pointer += n_param
-        assert pointer == recovered_update.numel(), "Mismatch in recovered update size!"
+            avg_delta.append(avg_update_flat[ptr:ptr+n_param].view(p.size()).detach())
+            ptr += n_param
+        assert ptr == avg_update_flat.numel(), "Mismatch in averaged update size!"
 
         buffer_updates = {}
         for buf_name, _ in global_model.named_buffers():
@@ -381,7 +352,7 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
             buffer_updates[buf_name] = summed / K_a
         global_model.load_state_dict(buffer_updates, strict=False)
 
-        # 4j) Update global model parameters via optimizer
+        # 4h) Update global model parameters via optimizer
         update_model_inplace(
             global_model,
             par_before,
@@ -394,7 +365,7 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
         )
         print("Global model parameters updated.")
 
-        # 4k) Evaluate global model on test set
+        # 4i) Evaluate global model on test set
         global_model.eval()
         correct = total = 0
         with torch.no_grad():
@@ -405,75 +376,62 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
                 total += yb.size(0)
         acc = correct / total
 
-        # 4l) Update history & early stopping
+        # 4j) Update history
         history['test_acc'].append(acc)
         print(f"Round {rnd}/{args.total_rounds} | Test Acc: {acc:.4%}")
-
         if acc > best_test_acc:
             best_test_acc = acc
             best_global_model_state = copy.deepcopy(global_model.state_dict())
-            best_rnd = rnd
-            rounds_no_improve = 0
-        else:
-            rounds_no_improve += 1
-            if rounds_no_improve >= args.early_stopping_patience:
-                print(f"Early stopping at round {rnd}. Best: {best_rnd} ({best_test_acc:.4%})")
-                break
-
-        torch.cuda.empty_cache()
         elapsed = time.time() - training_start
         if elapsed >= max_duration:
-            print(f"⏱️  Time limit reached ({elapsed/3600:.2f} h), stopping at round {rnd}.")
+            print(f"⏱️  Time limit reached, stopping at round {rnd}.")
             break
 
-    return history, best_global_model_state, dataset_collector.out_path
+    dataset_path = dataset_collector.finalize_and_save()
+    return history, best_global_model_state, dataset_path
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dataset Collection via Wireless Federated Edge Learning with Perfect Aggregation")
+    parser = argparse.ArgumentParser(description="Perfect Aggregation FEEL Dataset Collection")
     
-    # === Pretraining Parameters ===
-    parser.add_argument('--train-size',       type=int,   default=400,help="number of training samples")
-    parser.add_argument('--valid-size',       type=int,   default=100,help="number of validation samples")
-    parser.add_argument('--test-size',        type=int,   default=100,help="number of test samples")
-    parser.add_argument('--early-stopping-patience', type=int, default=20, help="early stopping patience")
-    parser.add_argument('--code-order',       type=str,   default="pop", choices=["none", "spectral", "spectral_pop", "pop"], help="codebook ordering strategy")
+    # === Training Dataset Parameters ===
+    parser.add_argument('--train-size', type=int, default=400, help="number of training samples (fragments)")
+    parser.add_argument('--valid-size', type=int, default=100, help="number of validation samples (fragments)")
+    parser.add_argument('--test-size', type=int, default=100, help="number of test samples (fragments)")
+    parser.add_argument('--num-test-rounds', type=int, default=1, help="number of rounds used in test set")
+    parser.add_argument('--within-round', type=str, default="random", choices=["prefix", "contig_rand", "random"], help="Sampling strategy within each round")
 
-    # === Dataset Parameters ===
-    parser.add_argument('--data-dir',         type=str, default="runs/datasets", help="path to CIFAR-10 dataset")
+    # === CIFAR Dataset Parameters ===
+    parser.add_argument('--data-dir', type=str, default="runs/datasets", help="path to CIFAR-10 dataset")
     parser.add_argument('--batch-size-train', type=int, default=16, help="batch size for training")
-    parser.add_argument('--batch-size-test',  type=int, default=16, help="batch size for testing")
-    parser.add_argument('--frac-random',      type=float, default=0.2, help="fraction of random samples per device")
+    parser.add_argument('--batch-size-test', type=int, default=16, help="batch size for testing")
+    parser.add_argument('--frac-random', type=float, default=0.2, help="fraction of random samples per device")
     
-    # === Federated Learning Parameters ===
-    parser.add_argument('--K-t',              type=int, default=40, help="total number of devices") # Make sure is a factor of 50,000
-    parser.add_argument('--min-p',            type=int, default=2, help="minimum participants per round")
-    parser.add_argument('--max-p',            type=int, default=2, help="maximum participants per round")
-    parser.add_argument('--total-rounds',     type=int, default=5, help="total number of global rounds")
-    parser.add_argument('--local-epochs',     type=int, default=3, help="number of local epochs per round")
-    parser.add_argument('--local-lr',         type=float, default=0.01, help="local learning rate")
+    # === Federated Learning (iFed) Parameters ===
+    parser.add_argument('--K-t', type=int, default=40, help="total number of devices")
+    parser.add_argument('--min-p', type=int, default=2, help="minimum participants per round")
+    parser.add_argument('--max-p', type=int, default=2, help="maximum participants per round")
+    parser.add_argument('--total-rounds', type=int, default=5, help="total number of global rounds")
+    parser.add_argument('--local-epochs', type=int, default=3, help="number of local epochs per round")
+    parser.add_argument('--local-lr', type=float, default=0.01, help="local learning rate")
+    parser.add_argument('--message-split', type=int, default=10, help="message split size L (quantization dimension)")
     
     # === Global Optimizer Parameters ===
-    parser.add_argument('--optimizer',        type=str, default='fedavg', choices=['fedavg', 'fedavgm', 'fedadam'], help="global optimizer type")
-    parser.add_argument('--global-lr',        type=float, default=1.0, help="global learning rate")
-    parser.add_argument('--momentum',         type=float, default=0.0, help='SGD momentum')
-    parser.add_argument('--beta1',            type=float, default=0.9, help='Adam beta1')
-    parser.add_argument('--beta2',            type=float, default=0.99, help='Adam beta2')
-    parser.add_argument('--eps',              type=float, default=0, help='Adam epsilon')
-    
-    # === Wireless Channel & Compression Parameters ===
-    parser.add_argument('--message-split',    type=int, default=10, help="message split size & quantization dimension")
-    parser.add_argument('--n',                type=int, default=256, help="number of codewords in codebooks")
-    parser.add_argument('--dim',              type=int, default=64, help="encoding dimension")
+    parser.add_argument('--optimizer', type=str, default='fedavg', choices=['fedavg', 'fedavgm', 'fedadam'], help="global optimizer type")
+    parser.add_argument('--global-lr', type=float, default=1.0, help="global learning rate")
+    parser.add_argument('--momentum', type=float, default=0.0, help='SGD momentum')
+    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.99, help='Adam beta2')
+    parser.add_argument('--eps', type=float, default=0, help='Adam epsilon')
 
     # === Model Selection ===
-    parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'custom'], help="which global model to use for data collection")
-    parser.add_argument('--custom-model', type=str, default='', help="for --model custom: 'module.path:ClassName'")  # Untested for custom models
-    parser.add_argument('--custom-kwargs', type=str, default='{}', help='for --model custom: JSON dict of ctor kwargs, e.g. {"num_classes":10}')  # Untested for custom models
+    parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'smallvgg', 'custom'], help="which global model to use for data collection")
+    parser.add_argument('--custom-model', type=str, default='', help="for --model custom: 'module.path:ClassName'")
+    parser.add_argument('--custom-kwargs', type=str, default='{}', help='for --model custom: JSON dict of ctor kwargs, e.g. {"num_classes":10}')
 
     # === System Parameters ===
-    parser.add_argument('--save-dir',         type=str, default="runs/results", help="directory to save results")
-    parser.add_argument('--seed',             type=int, default=42, help="random seed")
+    parser.add_argument('--save-dir', type=str, default="runs/results", help="directory to save results")
+    parser.add_argument('--seed', type=int, default=42, help="random seed")
     args = parser.parse_args()
 
     # Set random seeds
@@ -512,12 +470,7 @@ if __name__ == "__main__":
         test_loader=test_loader,
         args=args,
         device=args.device,
-        make_model=make_model,
+        make_model=make_model
     )
-    save_pi_minimal_artifacts(dataset_path, args, base_name="pi_rounds_min")
-
-    # Print accuracy curve & dataset analysis
     plot_dataset_collection_history(history, os.path.join(args.save_dir, "history_plots"))
-    analysis_dir = os.path.join(args.save_dir, 'analysis')
-    analyze_dataset(path=dataset_path, rounds_to_plot=None, save_dir=analysis_dir)
-
+    print(f"Dataset collection complete. Bundle saved to: {dataset_path}")

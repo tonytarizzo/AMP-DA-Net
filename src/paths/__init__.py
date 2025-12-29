@@ -3,9 +3,12 @@ from .dataset_handling import (
     _fmt_float,
     _norm_order_tag,
     make_dataset_slug,
+    make_raw_dataset_slug,
     load_ifed_from_args,
     load_ifed_bundle,
     auto_find_dataset,
+    auto_find_raw_dataset,
+    load_raw_ifed_bundle,
 )
 from .pretrain_handling import (
     make_core_cb_tag,

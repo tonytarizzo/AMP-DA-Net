@@ -29,8 +29,18 @@ python -u -m scripts.3_feel_inference \
   --snr-mode              range \
   --snr-min-db            0.0 \
   --snr-max-db            20.0 \
-  --post-rounding         \
+  --post-rounding \
   --code-order            pop \
+  \
+  --agg-method            average \
+  --trim-frac             0.1 \
+  --corruption-frac       0.0 \
+  --use-error-feedback \
+  \
+  --kmeans-max-iter       0 \
+  --curv-mode             none \
+  --curv-max-samples      10000 \
+  --curv-eps              1e-6 \
   \
   --num-layers            10 \
   --num-filters           32 \
@@ -46,10 +56,12 @@ python -u -m scripts.3_feel_inference \
   --K-max                 -1 \
   --blend-init            0.85 \
   \
-  --ckpt-dir              "runs/checkpoints" \
+  --ckpt-dir              "runs/checkpoints/pretrain" \
   --codebook-init         gaussian \
   --codebook-trainable \
   --within-round          random \
+  --quant-type            kmeans_plusplus \
+  --lambda-q              0.0 \
   --model                 resnet \
   \
   --early-stopping-patience 50 \

@@ -14,11 +14,19 @@ def _norm_order_tag(order: str | None):
         return "spectral+pop"
     return str(order)
 
-def make_dataset_slug(*, model: str, order: str, n: int, dim: int, msg: int, Kt: int,
-                      pmin: int, pmax: int, frac_random: float, seed: int):
+def make_dataset_slug(*, model: str, order: str, n: int, dim: int, msg: int, Kt: int, pmin: int, pmax: int, frac_random: float, seed: int):
     # e.g. ifed_resnet_pop_cb(256_64_10)_Kt40_p(2-8)_fr0.20_seed42
     return (
         f"ifed_{model}_{order}_cb({n}_{dim}_{msg})"
+        f"_Kt{Kt}_p({pmin}-{pmax})_fr{_fmt_float(frac_random,2)}_seed{seed}"
+    )
+
+def make_raw_dataset_slug(*, model: str, D: int, L: int, Kt: int, pmin: int, pmax: int, frac_random: float, seed: int):
+    """Slug for new per-device raw iFed bundle format."""
+    # e.g. ifed_resnet_raw(D=523k_L=20)_Kt40_p(2-8)_fr0.2_seed42
+    Dk = f"{int(round(D/1000))}k" if D >= 1000 else str(D)
+    return (
+        f"ifed_{model}_raw(D={Dk}_L={L})"
         f"_Kt{Kt}_p({pmin}-{pmax})_fr{_fmt_float(frac_random,2)}_seed{seed}"
     )
 
@@ -45,6 +53,62 @@ def load_ifed_from_args(args, device):
 
     assert X_all.size(0) == R * round_len, "Dataset shape mismatch: (R*S) != X_all.size(0)"
     return (bundle_path, X_all, K_rounds_all, pi_targets_rounds_all, pi_est_rounds_all, idx_rounds_all, R, round_len)
+
+
+def auto_find_raw_dataset(args):
+    """Return a raw iFed bundle path based on --dataset-path, --dataset-slug, or composed prefix."""
+    # 1) Direct path wins
+    if getattr(args, "dataset_path", ""):
+        p = args.dataset_path
+        if os.path.isfile(p):
+            return p
+        raise FileNotFoundError(f"--dataset-path not found: {p}")
+
+    # 2) Explicit slug (fuzzy ok)
+    if getattr(args, "dataset_slug", ""):
+        cand = os.path.join(args.dataset_dir, args.dataset_slug + ".pth")
+        if os.path.isfile(cand):
+            return cand
+        matches = [f for f in os.listdir(args.dataset_dir) if args.dataset_slug in f and f.endswith(".pth")]
+        if len(matches) == 1:
+            return os.path.join(args.dataset_dir, matches[0])
+        if len(matches) > 1:
+            raise RuntimeError(f"Multiple datasets match slug '{args.dataset_slug}': {matches}")
+        raise FileNotFoundError(f"No dataset matches slug '{args.dataset_slug}' in {args.dataset_dir}")
+
+    # 3) Try to find by prefix matching model tag
+    model_tag = _model_tag_from_args(args)
+    prefix = f"ifed_{model_tag}_raw("
+    cands = [f for f in os.listdir(args.dataset_dir) if f.endswith(".pth") and f.startswith(prefix)]
+    if len(cands) == 1:
+        return os.path.join(args.dataset_dir, cands[0])
+    if len(cands) == 0:
+        raise FileNotFoundError(f"No iFed raw bundles under {args.dataset_dir} (prefix '{prefix}').")
+    raise RuntimeError("Multiple raw bundles found; specify --dataset-slug or --dataset-path.\n"
+                       "Candidates: " + ", ".join(cands))
+
+
+def load_raw_ifed_bundle(args, device):
+    """Load the new per-device raw iFed bundle format."""
+    path = auto_find_raw_dataset(args)
+    bundle = torch.load(path, map_location=device)
+    meta = bundle.get("meta", {})
+
+    if str(meta.get("kind", "")) != "ifed_raw_per_device":
+        raise ValueError(f"Unexpected bundle kind: {meta.get('kind')} (expected 'ifed_raw_per_device')")
+    if int(bundle.get("L", -1)) != int(args.message_split):
+        raise ValueError(f"L mismatch: dataset L={bundle.get('L')} vs args.message_split={args.message_split}")
+    
+    # Soft checks (do not hard-fail; just warn if present)
+    model_tag = _model_tag_from_args(args)
+    if meta.get("model") and str(meta["model"]) != model_tag:
+        print(f"[warn] model tag differs: dataset={meta['model']} vs args={model_tag}")
+    for k in ["K_t", "min_p", "max_p"]:
+        if k in meta and int(meta[k]) != int(getattr(args, k.replace("_", "-").replace("K-t", "K_t"), meta[k])):
+            print(f"[warn] {k} differs: dataset={meta[k]} vs args={getattr(args, k.replace('_', '-').replace('K-t', 'K_t'), 'N/A')}")
+
+    print(f"[dataset] Loaded raw iFed bundle: {path}")
+    return path, bundle
 
 
 def load_ifed_bundle(args, device):

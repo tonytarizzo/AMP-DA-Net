@@ -3,24 +3,6 @@ import math
 import numpy as np
 import torch
 
-def omp(y, C, K_a):
-    """Simple Orthogonal Matching Pursuit (OMP) implementation. Complex case not supported."""
-    l = 0
-    x_recovered = np.zeros(C.shape[1])
-    indices = np.zeros(K_a, dtype=int)
-
-    while l < K_a:
-        inner_product = C.T @ y
-        indices[l] = np.argmax(np.abs(inner_product))
-
-        C_sub = C[:, indices[:l+1]]
-        x_ls = np.linalg.pinv(C_sub) @ y
-        x_recovered[indices[:l+1]] = x_ls
-
-        y = y - np.dot(C, x_recovered)
-        l += 1
-    return x_recovered
-
 def ista(y, C, K_a=None, sigma=None, tau=None, lambda_val=None,
          max_iters=1000, tol=1e-6, debias=True, alpha=None, safety=0.99,
          complex_valued=False):

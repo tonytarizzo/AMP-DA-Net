@@ -101,3 +101,43 @@ def get_round_perm(mode: str, Q: torch.Tensor, idx_mini: torch.Tensor, pi_est: t
         perm, inv_perm = make_perm_spectral(Q, idx_mini=idx_mini, pi_est=pi_est, blend_pop=1.0, trans_weight=0.3)
         return perm, inv_perm
     raise ValueError(f"Unknown codebook ordering mode: {mode!r}")
+
+
+@torch.no_grad()
+def compute_probability_prior(Q_r: torch.Tensor, bs_blocks_r: torch.Tensor, device) -> torch.Tensor:
+    """Compute π̂ from base station local blocks and the round's codebook Q_r."""
+    if Q_r.device != device or Q_r.dtype != torch.float32:
+        Q = Q_r.to(device=device, dtype=torch.float32)
+    else:
+        Q = Q_r
+    if bs_blocks_r.device != device or bs_blocks_r.dtype != torch.float32:
+        Xbs = bs_blocks_r.to(device=device, dtype=torch.float32)
+    else:
+        Xbs = bs_blocks_r
+    idx = torch.cdist(Xbs, Q, p=2).argmin(dim=1)              # [S]
+    counts = torch.bincount(idx, minlength=Q_r.size(0)).to(torch.float32)
+    return (counts / counts.sum().clamp_min(1e-12)).contiguous()
+
+
+@torch.no_grad()
+def apply_ordering(Q_r: torch.Tensor, pi_est: torch.Tensor, code_order: str, bs_blocks_r: torch.Tensor):
+    """
+    Compute idx_mini on the *current (raw) Q_r*, build perm via code_order, and
+    return the permuted (Q, pi) along with (perm, inv_perm).
+    """
+    dev = Q_r.device
+    if bs_blocks_r.device != dev or bs_blocks_r.dtype != torch.float32:
+        bs_gpu = bs_blocks_r.to(dev, torch.float32)
+    else:
+        bs_gpu = bs_blocks_r
+    if Q_r.dtype != torch.float32:
+        Q_gpu = Q_r.to(torch.float32)
+    else:
+        Q_gpu = Q_r
+    idx_mini = torch.cdist(bs_gpu, Q_gpu, p=2).argmin(dim=1)  # [S]
+    perm, inv_perm = get_round_perm(code_order, Q_r, idx_mini, pi_est)
+    if perm is None:
+        return Q_r, pi_est, None, None
+    Q_ord = Q_r.index_select(0, perm)
+    pi_ord = pi_est.index_select(0, perm)
+    return Q_ord, pi_ord, perm, inv_perm

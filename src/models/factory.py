@@ -1,7 +1,7 @@
 
 import importlib
 import json
-from .resnet import ResNetSimple
+from .resnet import ResNetSimple, SmallVGG
 from .simple_cnn import CIFAR10CNN
 
 
@@ -21,6 +21,11 @@ def _model_factory_from_args(args):
         kwargs = {}
         tag = 'cifarcnn'
         cls_name = 'CIFAR10CNN'
+    elif args.model == 'smallvgg':
+        cls = SmallVGG
+        kwargs = {}
+        tag = 'smallvgg'
+        cls_name = 'SmallVGG'
     else:
         if not args.custom_model or ':' not in args.custom_model:
             raise ValueError("For --model custom, provide --custom-model like 'pkg.mod:ClassName'")
@@ -45,6 +50,8 @@ def _model_tag_from_args(args):
         return 'resnet'
     if args.model == 'cifarcnn':
         return 'cifarcnn'
+    if args.model == 'smallvgg':
+        return 'smallvgg'
     if args.model == 'custom':
         # Expect --custom-model like 'pkg.mod:ClassName'
         cls = None
@@ -59,6 +66,8 @@ def build_global_model(args):
         return ResNetSimple()
     if args.model == "cifarcnn":
         return CIFAR10CNN()
+    if args.model == "smallvgg":
+        return SmallVGG()
     if args.model == "custom":
         mod_str, cls_str = args.custom_model.split(":", 1)
         mod = importlib.import_module(mod_str)

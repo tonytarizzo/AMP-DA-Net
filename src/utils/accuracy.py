@@ -37,21 +37,6 @@ def compute_nmse(x, x_recovered):
     """
     return np.linalg.norm(x - x_recovered)**2 / (np.linalg.norm(x)**2 + 1e-8)
 
-def compute_rsnr(x, x_recovered):
-    """
-    Compute the Reconstruction Signal-to-Noise Ratio (RSNR) in dB.
-    
-    RSNR = 10 * log10( ||x||^2 / ||x - x_recovered||^2 )
-    Higher RSNR means better recovery.
-    """
-    x = np.array(x, dtype=float)
-    x_recovered = np.array(x_recovered, dtype=float)
-
-    signal_power = np.linalg.norm(x)**2
-    error_power = np.linalg.norm(x - x_recovered)**2 + 1e-8  # small epsilon to avoid log(0)
-    
-    return 10 * np.log10(signal_power / error_power)
-
 def compute_accuracy_batch(X, X_rec):
     """
     Normalised L1 accuracy for a batch.
@@ -89,15 +74,3 @@ def compute_nmse_batch(X, X_rec):
     num   = np.sum((X - X_rec) ** 2, axis=1)
     den   = np.sum(X ** 2, axis=1) + 1e-8
     return num / den
-
-def compute_rsnr_batch(X, X_rec):
-    """
-    Reconstruction SNR (dB) for a batch.
-    RSNR_i = 10·log10( ‖x_i‖² / ‖x_i - x̂_i‖² )
-    """
-    X     = np.asarray(X,     dtype=float)
-    X_rec = np.asarray(X_rec, dtype=float)
-
-    signal_pwr = np.sum(X ** 2, axis=1)
-    error_pwr  = np.sum((X - X_rec) ** 2, axis=1) + 1e-8
-    return 10.0 * np.log10(signal_pwr / error_pwr)

@@ -1,8 +1,10 @@
-
+"""Pretraining script for URA codebook and AMP-DA-Net."""
 import argparse
 import os
-import gc, copy
+import gc
+import copy
 import math
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -10,17 +12,20 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from src.codebooks import (
     normalize_codebook, 
     make_gaussian_codebook, 
-    make_bernoulli_codebook, 
-    compute_q_init,
+    make_bernoulli_codebook,
+    create_quantisation_codebook,
+    get_round_perm,
+    compute_probability_prior,
+    apply_ordering,
 )
 from src.decoding import (
     AMPNet1DEnhanced, 
-    SimAMPNetLossWithSparsity,
     ista,
     amp_da,
     greedy_rounding,
@@ -28,7 +33,7 @@ from src.decoding import (
     top_k_nonneg,
 )
 from src.paths import (
-    load_ifed_from_args, 
+    load_raw_ifed_bundle,
     save_pretrained_artifacts,
     _sha1_tensor,
 )
@@ -45,7 +50,6 @@ from src.utils import (
     _parse_snr_list,
 )
 from src.analysis import (
-    pi_from_indices,
     plot_pretraining,
     plot_parameter_traces,
     analyse_codebook,
@@ -59,6 +63,7 @@ from src.analysis import (
 
 @dataclass
 class BlockMeta:
+    """Metadata for a fragment block in the split."""
     r_global: int
     local_start: int
     local_end: int
@@ -70,251 +75,118 @@ class BlockMeta:
     @property
     def block_len(self) -> int:
         return self.local_end - self.local_start
+
+
+def split_to_tensors(split_pack, K_rounds_vec: torch.Tensor, *, device) -> tuple[torch.Tensor, torch.Tensor, list[BlockMeta]]:
+    """
+    Convert a split pack from the raw bundle into tensors and metadata.
     
-
-def split_round_ids(R, args):
-    g = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(R, generator=g).tolist()
-    n_test = min(max(int(args.num_test_rounds), 0), max(R - 1, 0))
-    test_round_ids = perm[:n_test]
-    remaining_rounds = [r for r in range(R) if r not in test_round_ids]
-    n_valid_rounds = max(1, min(len(remaining_rounds)-1, int(0.10 * len(remaining_rounds)))) if len(remaining_rounds) > 1 else 0
-    valid_round_ids = remaining_rounds[:n_valid_rounds]
-    train_round_ids = remaining_rounds[n_valid_rounds:] if n_valid_rounds > 0 else remaining_rounds
-    return train_round_ids, valid_round_ids, test_round_ids
-
-
-def build_split(
-    X_all, K_rounds_all,
-    wanted_samples, R, round_len, batch_size,
-    shuffle_rounds=False,
-    max_batches_per_round=None,
-    round_pool=None,
-    within_round: str = "random",   # Random is most principled, but prefix retains within round order. Options: ['prefix' | 'contig_rand' | 'random']
-):
-    """
-    Build a split where:
-      - each selected round contributes at most `max_batches_per_round` batches,
-      - batches are contiguous per round (round-pure),
-      - total length is batch-aligned,
-      - we return BlockMeta for each contiguous per-round block.
-
-    within_round options:
-      - 'prefix'      → take the first N samples of the round.
-      - 'contig_rand' → take one contiguous window at a random start position.
-      - 'random'      → take N samples uniformly w/o replacement across the round (non-contiguous selection).
-
+    split_pack: {"X": FloatTensor [N_rows, L], "frags": List[dict(round,pos,K_a,rows=[s,e))]}
+    K_rounds_vec: LongTensor [R] (per-round K_a)
+    
     Returns:
-      X_split [N, n], K_vec [N], blocks_meta [List[BlockMeta]]
+      X_split [N_rows, L] on device
+      K_vec   [N_rows]   (per-row K_a copied from its fragment's round)
+      blocks  list[BlockMeta] (one block per fragment, contiguous in local coords)
     """
-    device = X_all.device
-    dtype  = torch.float32
-    g = torch.Generator(device=X_all.device).manual_seed(args.seed)  # for now use that arg is global
+    X = split_pack["X"].to(device=device, dtype=torch.float32)  # [N_rows, L]
+    frags = split_pack["frags"]
 
-    cap_batches = round_len // batch_size
-    if cap_batches == 0:
-        raise ValueError("pt_batch_size is larger than samples-per-round; decrease pt_batch_size or increase round_len.")
-
-    target_len     = (wanted_samples // batch_size) * batch_size
-    target_batches = target_len // batch_size
-    if target_batches == 0:
-        raise ValueError("wanted_samples < batch_size after alignment; increase wanted_samples or reduce batch_size.")
-
-    # --- limit the candidate rounds ---
-    if round_pool is None:
-        candidate_rounds = list(range(R))
-    else:
-        candidate_rounds = list(round_pool)
-    if not candidate_rounds:
-        raise ValueError("round_pool is empty; no rounds available for this split.")
-
-    if shuffle_rounds:
-        perm = torch.randperm(len(candidate_rounds)).tolist()
-        candidate_rounds = [candidate_rounds[p] for p in perm]
-
-    R_eff = len(candidate_rounds)  # effective number of rounds we draw from
-
-    # per-round cap (in batches)
-    if max_batches_per_round in (None, "auto"):
-        max_b = (target_batches + R_eff - 1) // R_eff   # ceil(target_batches / R_eff)
-    else:
-        max_b = int(max(1, max_batches_per_round))
-    max_b = min(max_b, cap_batches)
-
-    if max_b * R_eff < target_batches:
-        raise ValueError(
-            f"Insufficient capacity: max_batches_per_round={max_b}, rounds={R_eff} "
-            f"→ capacity {max_b*R_eff} < target_batches {target_batches}."
-        )
-
-    # accumulate
-    blocks_X, blocks_K = [], []
-    blocks_meta: list[BlockMeta] = []
-    total_batches = 0
-    local_cursor = 0
-
-    mode = str(within_round).lower()
-    if mode not in {"prefix","contig_rand","random"}:
-        raise ValueError(f"within_round must be one of ['prefix','contig_rand','random'], got {within_round!r}")
-
-    for r in candidate_rounds:
-        if total_batches >= target_batches:
-            break
-
-        take_batches = min(max_b, target_batches - total_batches)
-        take_samples = take_batches * batch_size
-        s_round_glb  = r * round_len
-
-        # --- choose indices inside the round ---
-        if mode == "prefix":
-            sel = torch.arange(
-                s_round_glb, s_round_glb + take_samples, device=device, dtype=torch.long
-            )
-        elif mode == "contig_rand":
-            max_start_b = max(0, cap_batches - take_batches)
-            if max_start_b == 0:
-                start_b = 0
-            else:
-                start_b = int(torch.randint(0, max_start_b + 1, (1,), generator=g).item())
-            s_glb = s_round_glb + start_b * batch_size
-            sel = torch.arange(s_glb, s_glb + take_samples, device=device, dtype=torch.long)
-        else:  # mode == "random"
-            offs = torch.randperm(round_len, generator=g, device=device)[:take_samples]
-            sel = s_round_glb + offs.to(torch.long)
-
-        X_blk = X_all.index_select(0, sel)
-        K_blk = torch.full((take_samples,), float(K_rounds_all[r].item()), device=device, dtype=dtype)
-        blocks_X.append(X_blk)
-        blocks_K.append(K_blk)
-
-        # record metadata
-        local_start = local_cursor
-        local_end = local_cursor + take_samples
-        blocks_meta.append(BlockMeta(
-            r_global=int(r),
-            local_start=int(local_start),
-            local_end=int(local_end),
-            global_start=int(sel[0].item()),
-            global_end=int(sel[-1].item()),
-            round_len=int(round_len),
-            sel_global=[int(x.item()) for x in sel]
+    # Build K per-row and blocks
+    K_rows = torch.empty((X.size(0),), device=device, dtype=torch.float32)
+    blocks = []
+    for f in frags:
+        r0 = int(f["round"])
+        s_row, e_row = int(f["rows"][0]), int(f["rows"][1])   # in X's local indexing
+        K_rows[s_row:e_row] = float(K_rounds_vec[r0].item())  # Fill K for rows in this fragment
+        blocks.append(BlockMeta(
+            r_global=r0,
+            local_start=s_row,
+            local_end=e_row,
+            global_start=s_row,
+            global_end=e_row,
+            round_len=-1,
+            sel_global=list(range(s_row, e_row))
         ))
-        local_cursor = local_end
-        total_batches += take_batches
-
-    if total_batches == 0:
-        raise ValueError("No samples taken; check wanted_samples, batch_size, round_len, and round_pool.")
-
-    X_split = torch.cat(blocks_X, dim=0)
-    K_vec = torch.cat(blocks_K, dim=0)
-
-    # Checks stats that should always be true
-    assert X_split.size(0) == total_batches * batch_size
-    for b in blocks_meta:
-        assert (b.local_end - b.local_start) == len(b.sel_global), "meta length mismatch vs selected indices"
-        assert b.local_start % batch_size == 0 and b.local_end % batch_size == 0
-
-    return X_split, K_vec, blocks_meta
+    return X, K_rows, blocks
 
 
-def select_block_from_Z_full(blk: BlockMeta, Z_full: torch.Tensor, round_len: int) -> torch.Tensor:
-    """Return the Z slice for a per-round block `blk` from the round-wise Z_full."""
-    r = blk.r_global
-    s_full = r * round_len
-    if getattr(blk, "sel_global", None):
-        offs = torch.tensor(blk.sel_global, device=Z_full.device, dtype=torch.long) - s_full
-        return Z_full.index_select(0, offs)
-    off0 = blk.global_start - s_full
-    off1 = off0 + (blk.global_end - blk.global_start)
-    return Z_full[off0:off1]
+def load_raw_splits(args, device):
+    """Load the new raw iFed bundle and materialize per-split tensors."""
+    bundle_path, bundle = load_raw_ifed_bundle(args, device=device)
+    args.bundle_path = bundle_path
+
+    K_rounds = bundle["K_rounds"].to(device=device)  # [R]
+    splits = bundle["splits"]                        # {"train": {...}, "valid": {...}, "test": {...}}
+
+    # Load tensors and fragments
+    train_X, train_K, train_frags = split_to_tensors(splits["train"], K_rounds, device=device)
+    valid_X, valid_K, valid_frags = split_to_tensors(splits["valid"], K_rounds, device=device)
+    test_X, test_K, test_frags = split_to_tensors(splits["test"], K_rounds, device=device)
+
+    print(f"[dataset] split sizes  train={train_X.size(0)}  valid={valid_X.size(0)}  test={test_X.size(0)}")
+    print(f"[dataset] fragment counts  train={len(train_frags)}  valid={len(valid_frags)}  test={len(test_frags)}")
+    return (train_X, train_K, train_frags,
+            valid_X, valid_K, valid_frags,
+            test_X, test_K, test_frags,
+            bundle)
 
 
-def save_codebook_analysis_artifacts(metrics, args, *, codebook_pt_path: str | None = None, plot_path: str | None = None, base_name: str = "codebook_analysis"):
-    """
-    Save analysis so plots can be fully recreated:
-      - <save_dir>/summaries/codebook_analysis.json        (scalars + meta)
-      - <save_dir>/summaries/codebook_analysis_arrays.npz  (arrays)
-    """
-    summ_dir = os.path.join(args.save_dir, "summaries")
-    os.makedirs(summ_dir, exist_ok=True)
-
-    # Arrays → NPZ (compressed)
-    arrays = metrics.get("_arrays", {})
-    arrays_to_save = {}
-    for key in ["G", "S", "rip_deltas", "G_hist_counts", "G_hist_edges"]:
-        if key in arrays and arrays[key] is not None:
-            arrays_to_save[key] = np.asarray(arrays[key])
-
-    npz_path = os.path.join(summ_dir, f"{base_name}_arrays.npz")
-    if arrays_to_save:
-        np.savez_compressed(npz_path, **arrays_to_save)
+def quantize(x_raw, Q):
+    """Quantize x_raw to nearest codeword in Q."""
+    if x_raw.device != Q.device or x_raw.dtype != Q.dtype:
+        x = x_raw.to(Q.device, dtype=Q.dtype)
     else:
-        npz_path = None
+        x = x_raw
+    dists = torch.cdist(x, Q, p=2)           # [B,n]
+    idx = torch.argmin(dists, dim=1)         # [B]
+    x_q = Q.index_select(0, idx)             # [B,L]
+    return idx, (x_q - x)
 
-    codebook_sha1 = None
-    try:
-        if "decoder_model" in globals():
-            codebook_sha1 = _sha1_tensor(decoder_model.C_syn.data.clone())
-    except Exception:
-        pass
 
-    # JSON (scalars + meta + file references)
-    scalars = metrics.get("_scalars", {})
-    cc_percentiles = metrics.get("_cc_percentiles", {})
-    cfg = metrics.get("_config", {})
-    basic = metrics.get("_basic", {})
-
-    json_payload = {
-        "metric_source": "codebook_analysis",
-        "version": 1,
-        "dimensions": metrics.get("dimensions"),
-        "basic": basic,  # {m, n}
-        "config": cfg,   # {k_rip, num_trials, heatmap_vmax, hist_bins}
-        "scalars": scalars,
-        "cc_percentiles": cc_percentiles,
-        "rip_quality": metrics.get("rip_quality", None),
-
-        # references
-        "files": {
-            "arrays_npz": (None if npz_path is None else os.path.relpath(npz_path, args.save_dir)),
-            "plot_path": (None if plot_path is None else os.path.relpath(plot_path, args.save_dir)),
-            "codebook_pt": (None if not codebook_pt_path else os.path.relpath(codebook_pt_path, args.save_dir)),
-        },
-        "codebook_sha1": codebook_sha1,
-        "context": run_manifest(args),
-    }
-    save_json(json_payload, os.path.join(summ_dir, f"{base_name}.json"))
+def aggregate_fragment_to_sparse_vector(device_rows, Q_r):
+    """Aggregate exactly K_a device rows into one sparse vector."""
+    K_a = device_rows.size(0)
+    
+    # Quantize all device rows
+    idx_all, q_err_all = quantize(device_rows, Q_r)  # [K_a], [K_a, L]
+    
+    # Convert to one-hots and sum
+    one_hots = F.one_hot(idx_all, num_classes=Q_r.size(0)).float()  # [K_a, n]
+    sparse_vec = one_hots.sum(dim=0)  # [n]
+    q_err_avg = q_err_all.mean(dim=0)  # [L]
+    
+    return sparse_vec, q_err_avg
 
 
 @torch.no_grad()
-def prepare_round(model: "PretrainDecoder",
-                  X_all: torch.Tensor,
-                  idx_all: torch.Tensor,
-                  round_id: int,
-                  round_len: int,
-                  snr_db_signal: float,
-                  *,
-                  use_counts_pi: bool = True,
-                  pi_target: torch.Tensor | None = None,
-                  ):
-    s = round_id * round_len
-    e = s + round_len
-    X_full   = X_all[s:e]
-    idx_full = idx_all[s:e]
-
-    # Use stream SNR for generating noisy measurements to be decoded
-    Z_full = model.encode_with_noise(X_full, snr_db_signal)
-    if use_counts_pi:
-        pi_round = pi_from_indices(idx_full, model.ampnet.n, X_full.device)
+def prepare_round(model, Q_r, bs_blocks_r, pi_round):
+    """Initialize AMPNet for a new round using base station blocks to form a clean signal."""
+    device = model.C_syn.device
+    if bs_blocks_r.device != device or bs_blocks_r.dtype != torch.float32:
+        Xbs = bs_blocks_r.to(device=device, dtype=torch.float32)
     else:
-        assert pi_target is not None, "pi_target required when use_counts_pi=False"
-        pi_round = pi_target.to(X_full.device).to(torch.float32)
-    model.ampnet.start_new_round(
-        z_round=Z_full,
-        pi_round=pi_round,
-        external_URA_codebook=model.C_syn,
-    )
-    return {"pi_round": pi_round, "Z_full": Z_full, "idx_full": idx_full}
+        Xbs = bs_blocks_r
+    if Q_r.device != device:
+        Q_gpu = Q_r.to(device)
+    else:
+        Q_gpu = Q_r
+    idx_bs = torch.cdist(Xbs, Q_gpu, p=2).argmin(dim=1)                 # [S]
+    x_onehot_bs = F.one_hot(idx_bs, num_classes=Q_r.size(0)).to(dtype=torch.float32)  # [S,n]
+    z_round = x_onehot_bs @ model.C_syn                              # [S,d] - clean encoded signal
+    model.ampnet.start_new_round(z_round=z_round, pi_round=pi_round, external_URA_codebook=model.C_syn)
+
+
+@torch.no_grad()
+def get_round_Q_pi(r: int, cache: dict, *, bundle, args):
+    """Get or create per-round quantization codebook and pi prior."""
+    if r not in cache:
+        bs = bundle["bs_local"][r]                                       # (S,L)
+        Q_raw = create_quantisation_codebook(bs, args)                   # (n,L)
+        pi_raw = compute_probability_prior(Q_raw, bs, device=args.device) # (n,)
+        Q_ord, pi_ord, perm, inv = apply_ordering(Q_raw, pi_raw, args.code_order, bs)
+        cache[r] = {"Q": Q_ord, "pi": pi_ord, "perm": perm, "inv": inv}
+    return cache[r]["Q"], cache[r]["pi"]
 
 
 class PretrainDecoder(nn.Module):
@@ -327,7 +199,7 @@ class PretrainDecoder(nn.Module):
         self.W = nn.Parameter(W_init.clone())
         self.num_layers = args.num_layers
 
-        # Respect fixed/learned URA codebook training (URA, not the quant codebook)
+        # Respect fixed/learned URA codebook training
         self.codebook_trainable = bool(getattr(args, "codebook_trainable", True))
         if not self.codebook_trainable:
             self.C_mat.requires_grad_(False)
@@ -372,15 +244,47 @@ class PretrainDecoder(nn.Module):
         return z, x_est, k_final, K_trace, sigma_trace
 
 
-def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, valid_blocks,
-                      X_all, idx_rounds_all, pi_est_rounds_all, round_len, args):
-    """Pretrain AMP-DA-Net & (optionally) URA codebook on the generated dataset."""
+class SimAMPNetLossWithSparsityQ(nn.Module):
+    """Loss function with sparsity, W orthogonality, K active device, and quantization penalties."""
+    def __init__(self, lambda_sparse=0.001, lambda_w=0.001, lambda_k=0.01, lambda_q=0.0):
+        super().__init__()
+        self.lambda_sparse = lambda_sparse
+        self.lambda_w = lambda_w
+        self.lambda_k = lambda_k
+        self.lambda_q = lambda_q
 
+    def forward(self, model, x_gt, x_pred, K_a, K_final, q_err):
+        # MSE reconstruction loss
+        rec_loss = F.mse_loss(x_pred, x_gt, reduction='mean')
+        
+        # L1 sparsity regularization
+        target_scale = torch.mean(torch.abs(x_gt)) + 1e-10
+        l1_norm = torch.mean(torch.abs(x_pred))
+        sparsity = l1_norm / target_scale
+
+        # W orthogonality regularization
+        I = torch.eye(model.W.shape[0], device=model.W.device, dtype=model.W.dtype)
+        w_reg = torch.norm(model.W.conj().T @ model.W - I, p='fro') ** 2
+
+        # K active device loss
+        K_pred = torch.as_tensor(K_final, device=K_a.device, dtype=K_a.dtype)
+        K_pred = K_pred.reshape(1).expand_as(K_a)
+        k_loss = F.mse_loss(K_pred, K_a.detach(), reduction='mean')
+
+        # Normalised Q error loss
+        q_loss = ((q_err.pow(2)).sum(dim=1) / (x_gt.pow(2).sum(dim=1).clamp_min(1e-8))).mean()
+        
+        return rec_loss + self.lambda_sparse * sparsity + self.lambda_w * w_reg + self.lambda_k * k_loss + self.lambda_q * q_loss
+
+
+def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, valid_blocks, bundle, args):
+    """Pretrain AMP-Net & (optionally) URA codebook on the generated dataset."""
+    
     # Codebook initialization options (all unit-norm rows)
-    init_mode = str(getattr(args, "codebook_init", "q_init")).lower()
+    init_mode = str(getattr(args, "codebook_init", "gaussian")).lower()
     if init_mode == "q_init":
-        snr_for_init = args.snr_db if args.snr_mode == 'fixed' else 0.5*(args.snr_min_db + args.snr_max_db)
-        C_init = compute_q_init(train_set, snr_for_init, args.dim, args.device)
+        print("[warn] Due to quantisation now being part of scope, q_init initialisation not possible, defaulting to gaussian")
+        C_init = make_gaussian_codebook(args.n, args.dim, args.device)
     elif init_mode == "gaussian":
         C_init = make_gaussian_codebook(args.n, args.dim, args.device)
     elif init_mode == "bernoulli":
@@ -392,7 +296,12 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
 
     # Model & loss init
     model = PretrainDecoder(args, C_init.to(args.device), W_init.to(args.device)).to(args.device)
-    criterion = SimAMPNetLossWithSparsity(lambda_sparse=args.lambda_sparse, lambda_w=args.lambda_w, lambda_k=args.lambda_k).to(args.device)
+    criterion = SimAMPNetLossWithSparsityQ(
+        lambda_sparse=args.lambda_sparse, 
+        lambda_w=args.lambda_w, 
+        lambda_k=args.lambda_k,
+        lambda_q=args.lambda_q
+    ).to(args.device)
 
     # Optimiser & scheduling init
     trainable_param_groups = []
@@ -412,7 +321,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
     best_model_state = None
     best_epoch = 0
     epochs_no_improve = 0
-    tol = float(getattr(args, "pt_delta", 1e-6))  # small tolerance for early stopping
+    tol = float(getattr(args, "pt_delta", 1e-6))
 
     train_losses, val_losses = [], []
     snr_next_train = make_snr_sampler(args, stream="train")
@@ -420,35 +329,95 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
     val_round_ids = sorted({b.r_global for b in valid_blocks})
     val_snr_by_round = {r: snr_next_val() for r in val_round_ids}
 
+    start_time = time.time()
     for epoch in range(args.pt_epochs):
         model.train()
         losses = []
+        q_cache = {}
+        
+        # Batch accumulators
+        sparse_batch = []
+        q_err_batch = []
+        K_batch = []
+        current_round_id = None
+        current_Q_r = None
+        current_pi_round = None
 
-        for blk in tqdm(train_blocks, desc=f"Epoch {epoch+1}"):
-            s_split, e_split = blk.local_start, blk.local_end
-            r_global = blk.r_global
+        for frag in tqdm(train_blocks, desc=f"Epoch {epoch+1}"):
+            r = frag.r_global
+            start, end = frag.local_start, frag.local_end
+            K_a = int(train_K[start].item())  # All rows in fragment have same K_a
 
-            snr_db_r = snr_next_train() 
-            prep = prepare_round(
-                model,
-                X_all=X_all,
-                idx_all=idx_rounds_all,
-                round_id=r_global,
-                round_len=round_len,
-                snr_db_signal=snr_db_r,
-                use_counts_pi=False,
-                pi_target=pi_est_rounds_all[r_global]
-            )
-            opt_amp.zero_grad(set_to_none=True)
-            for i in range(s_split, e_split, args.pt_batch_size):
-                batch_x_true = train_set[i:i+args.pt_batch_size]
-                batch_k_true = train_K[i:i+batch_x_true.size(0)].to(dtype=torch.float32)
+            # Per-round quantisation, popularity prior, model cache update
+            if r not in q_cache:
+                Q_r, pi_r = get_round_Q_pi(r, q_cache, bundle=bundle, args=args)
+            
+            Q_r = q_cache[r]["Q"]
+            pi_round = q_cache[r]["pi"]
 
-                _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, pi=prep["pi_round"], use_cached_sigma=True)
-                loss = criterion(model, batch_x_true, x_hat, batch_k_true, k_final)
+            # If round changed, process any accumulated batch first
+            if current_round_id is not None and current_round_id != r and len(sparse_batch) > 0:
+                batch_x = torch.stack(sparse_batch)  # [B, n]
+                batch_q_err = torch.stack(q_err_batch)  # [B, L]
+                batch_K = torch.tensor(K_batch, device=args.device, dtype=torch.float32)  # [B]
+                
+                opt_amp.zero_grad(set_to_none=True)
+                snr_db = snr_next_train()
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+                loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                 loss.backward()
-                losses.append(float(loss.item()))
-            opt_amp.step()  # one step per contiguous round block (keeps cache coherent)
+                opt_amp.step()
+                losses.append(float(loss.detach().item()))
+                
+                # Reset batch
+                sparse_batch, q_err_batch, K_batch = [], [], []
+
+            # Update round tracking and prepare model
+            if current_round_id != r:
+                current_round_id = r
+                current_Q_r = Q_r
+                current_pi_round = pi_round
+                prepare_round(model, Q_r, bundle["bs_local"][r], pi_round)
+            
+            # Aggregate this fragment (K_a rows) → 1 sparse vector
+            device_rows = train_set[start:end]  # [K_a, L]
+            sparse_vec, q_err = aggregate_fragment_to_sparse_vector(device_rows, Q_r)  # [n], [L]
+            
+            # Collect sparse vectors into batches
+            sparse_batch.append(sparse_vec)
+            q_err_batch.append(q_err)
+            K_batch.append(float(K_a))
+            
+            # When batch is full, train
+            if len(sparse_batch) >= args.pt_batch_size:
+                batch_x = torch.stack(sparse_batch)  # [B, n]
+                batch_q_err = torch.stack(q_err_batch)  # [B, L]
+                batch_K = torch.tensor(K_batch, device=args.device, dtype=torch.float32)  # [B]
+                
+                opt_amp.zero_grad(set_to_none=True)
+                snr_db = snr_next_train()
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+                loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
+                loss.backward()
+                opt_amp.step()
+                losses.append(float(loss.detach().item()))
+                
+                # Reset batch
+                sparse_batch, q_err_batch, K_batch = [], [], []
+        
+        # Handle final remainder batch at end of epoch
+        if len(sparse_batch) > 0:
+            batch_x = torch.stack(sparse_batch)  # [B, n]
+            batch_q_err = torch.stack(q_err_batch)  # [B, L]
+            batch_K = torch.tensor(K_batch, device=args.device, dtype=torch.float32)  # [B]
+            
+            opt_amp.zero_grad(set_to_none=True)
+            snr_db = snr_next_train()
+            _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+            loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
+            loss.backward()
+            opt_amp.step()
+            losses.append(float(loss.detach().item()))
 
         avg_loss = float(np.mean(losses)) if losses else 0.0
         train_losses.append(avg_loss)
@@ -457,26 +426,85 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
         model.eval()
         val_losses_round = []
         with torch.no_grad():
-            for blk in valid_blocks:
-                s_split, e_split = blk.local_start, blk.local_end
-                r_global = blk.r_global
+            val_sparse_batch = []
+            val_q_err_batch = []
+            val_K_batch = []
+            val_current_round_id = None
+            val_current_pi_round = None
+            val_current_snr_db = None
+            
+            for frag in valid_blocks:
+                r = frag.r_global
+                start, end = frag.local_start, frag.local_end
+                K_a = int(valid_K[start].item())
 
-                snr_db_r = val_snr_by_round[r_global] 
-                prep = prepare_round(model, X_all, idx_rounds_all, r_global, round_len,
-                                     snr_db_signal=snr_db_r,
-                                     use_counts_pi=False, pi_target=pi_est_rounds_all[r_global])
-                for j in range(s_split, e_split, args.pt_batch_size):
-                    batch_x_true = valid_set[j:j+args.pt_batch_size]
-                    batch_k_true = valid_K[j:j+batch_x_true.size(0)].to(dtype=torch.float32)
+                if r not in q_cache:
+                    Q_r, pi_r = get_round_Q_pi(r, q_cache, bundle=bundle, args=args)
+                
+                Q_r = q_cache[r]["Q"]
+                pi_round = q_cache[r]["pi"]
+                snr_db_r = val_snr_by_round[r]
 
-                    _, x_hat, k_final, _, _ = model(batch_x_true, snr_db=snr_db_r, pi=prep["pi_round"], use_cached_sigma=True)
-                    val_losses_round.append(criterion(model, batch_x_true, x_hat, batch_k_true, k_final).item())
+                # If round changed, process any accumulated batch first
+                if val_current_round_id is not None and val_current_round_id != r and len(val_sparse_batch) > 0:
+                    batch_x = torch.stack(val_sparse_batch)
+                    batch_q_err = torch.stack(val_q_err_batch)
+                    batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
+                    
+                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                    val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
+                    val_losses_round.append(float(val_loss.detach().item()))
+                    
+                    val_sparse_batch, val_q_err_batch, val_K_batch = [], [], []
+
+                # Update round tracking and prepare model
+                if val_current_round_id != r:
+                    val_current_round_id = r
+                    val_current_pi_round = pi_round
+                    val_current_snr_db = snr_db_r
+                    prepare_round(model, Q_r, bundle["bs_local"][r], pi_round)
+
+                # Aggregate this fragment
+                device_rows = valid_set[start:end]
+                sparse_vec, q_err = aggregate_fragment_to_sparse_vector(device_rows, Q_r)
+                
+                val_sparse_batch.append(sparse_vec)
+                val_q_err_batch.append(q_err)
+                val_K_batch.append(float(K_a))
+                
+                # When batch is full, evaluate
+                if len(val_sparse_batch) >= args.pt_batch_size:
+                    batch_x = torch.stack(val_sparse_batch)
+                    batch_q_err = torch.stack(val_q_err_batch)
+                    batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
+                    
+                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                    val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
+                    val_losses_round.append(float(val_loss.detach().item()))
+                    
+                    val_sparse_batch, val_q_err_batch, val_K_batch = [], [], []
+            
+            # Handle final remainder batch
+            if len(val_sparse_batch) > 0:
+                batch_x = torch.stack(val_sparse_batch)
+                batch_q_err = torch.stack(val_q_err_batch)
+                batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
+                
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
+                val_losses_round.append(float(val_loss.detach().item()))
 
         val_loss = float(np.mean(val_losses_round)) if val_losses_round else 0.0
         val_losses.append(val_loss)
         sched_amp.step(val_loss)
         lr_amp = sched_amp.optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{args.pt_epochs} AMP-train={train_losses[-1]:.6f} AMP-val={val_loss:.6f} LR_AMP={lr_amp:.6f}")
+
+        # Runtime check: if elapsed time >= 17 hours, stop training
+        elapsed_hours = (time.time() - start_time) / 3600
+        if elapsed_hours >= 17:
+            print(f"[early stop] Time limit reached after {elapsed_hours:.2f} hours, proceeding to evaluation")
+            break
 
         # Early stopping with tolerance
         if val_loss < (best_val_loss - tol):
@@ -496,7 +524,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
         model.load_state_dict(best_model_state)
         print(f"Best Train Loss: {best_train_loss:.6f}, Best Validation Loss: {best_val_loss:.6f}")
 
-    plot_pretraining(train_losses, val_losses, epoch+1, args.amp_lr, args.pt_batch_size, len(train_set), args.num_layers, args.save_dir)
+    plot_pretraining(train_losses, val_losses, epoch+1, args.amp_lr, args.pt_batch_size, len(train_blocks), args.num_layers, args.save_dir)
     dec_pth, cb_pt = save_pretrained_artifacts(model, args)
 
     with torch.no_grad():
@@ -509,25 +537,6 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
 
         print(f"n={amp.n}  d={amp.d}  T={amp.T}  "
               f"K_max={'adaptive (2*Ka)' if amp.fixed_Kmax is None else amp.fixed_Kmax}")
-
-        alpha_mix = torch.sigmoid(amp.alpha_mix_raw.detach()).cpu().numpy()
-        print(f"alpha_mix (prior↔posterior) per-layer summary → "
-              f"mean={alpha_mix.mean():.3f}, min={alpha_mix.min():.3f}, max={alpha_mix.max():.3f}")
-
-        scale_out = amp._scale_centered(amp.res_scale_raw, 0.3, 2.0).detach().cpu().numpy()
-        inv_scale = amp._scale_centered(amp.inv_scale_raw, 0.5, 2.0).detach().cpu().numpy()
-        damp      = torch.sigmoid(amp.damp_raw).detach().cpu().numpy()
-        mix       = torch.sigmoid(amp.mix_raw).detach().cpu().numpy()
-        tau       = torch.exp(amp.log_tau).detach().cpu().numpy()
-        sK        = (2.0 * torch.sigmoid(amp.k_step_raw)).detach().cpu().numpy()
-        sPi       = torch.sigmoid(amp.pi_step_raw).detach().cpu().numpy()
-        sSig      = torch.sigmoid(amp.sigma_step_raw).detach().cpu().numpy()
-
-        for t in range(amp.T):
-            print(f"Layer {t+1:02d}: "
-                  f"scale_out={scale_out[t]:.3f}, inv_scale={inv_scale[t]:.3f}, "
-                  f"damp={damp[t]:.3f}, mix(CNN)={mix[t]:.3f}, tau={tau[t]:.3f}, "
-                  f"sK={sK[t]:.3f}, sPi={sPi[t]:.3f}, sSig={sSig[t]:.3f}")
 
         I = torch.eye(model.W.shape[0], device=model.W.device)
         W_dev = torch.norm(model.W.mH @ model.W - I, p='fro').item()
@@ -546,365 +555,401 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
     return model, pt_stats
 
 
-def evaluate_model(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_rounds_all, pi_targets_rounds_all, X_all, round_len, args):
-    """Evaluate model using the same noisy signals for decoding."""
+def evaluate_model(model, test_set, test_K, test_blocks, bundle, args):
+    """Evaluate model with per-round parameter estimation using the same noisy signals for decoding."""
     model.eval()
     nmse_values, accuracy_values, pupe_values = [], [], []
     estimation_logs = []
+
     snr_next_eval = make_snr_sampler(args, stream="eval")
-    eval_snr_by_round = {}
+    snr_by_round = {}
+    q_cache = {}
 
     with torch.no_grad():
-        for round_idx, blk in enumerate(test_blocks):
-            s_loc, e_loc = blk.local_start, blk.local_end
-            s_glb, e_glb = blk.global_start, blk.global_end
-            r = blk.r_global
+        # Track fragments by round for per-round reporting
+        round_fragments = {}
+        for frag in test_blocks:
+            r = frag.r_global
+            if r not in round_fragments:
+                round_fragments[r] = []
+            round_fragments[r].append(frag)
+        
+        # Process each round
+        for round_idx, r in enumerate(sorted(round_fragments.keys())):
+            frags_in_round = round_fragments[r]
+            
+            # 1) Per-round SNR + (Q_r, pi_r) + AMP init
+            if r not in snr_by_round:
+                snr_by_round[r] = snr_next_eval()
 
-            if r not in eval_snr_by_round:
-                eval_snr_by_round[r] = snr_next_eval()
+            snr_db_r = snr_by_round[r]
+            Q_r, pi_r = get_round_Q_pi(r, q_cache, bundle=bundle, args=args)
+            prepare_round(model, Q_r, bundle["bs_local"][r], pi_r)
 
-            # Round-level metadata / targets
-            pi_est  = pi_est_rounds_all[r]
+            # 2) Aggregate all fragments in this round to sparse vectors
+            sparse_vecs_round = []
+            K_sparse_round = []
+            
+            for frag in frags_in_round:
+                start, end = frag.local_start, frag.local_end
+                K_a = int(test_K[start].item())
+                
+                device_rows = test_set[start:end]  # [K_a, L]
+                sparse_vec, _ = aggregate_fragment_to_sparse_vector(device_rows, Q_r)  # [n]
+                
+                sparse_vecs_round.append(sparse_vec)
+                K_sparse_round.append(float(K_a))
+            
+            if len(sparse_vecs_round) == 0:
+                continue
+            
+            sparse_vecs = torch.stack(sparse_vecs_round)  # [N_sparse, n]
+            K_sparse = torch.tensor(K_sparse_round, device=args.device, dtype=torch.float32)  # [N_sparse]
+            
+            # 3) Decode batches of sparse vectors
+            K_last, Sig_last, W = [], [], []
+            K_tr_all, Sig_tr_all = [], []
 
-            # Estimation using all samples from the round
-            snr_db_r = eval_snr_by_round[r]
-            prep = prepare_round(
-                model,
-                X_all=X_all,
-                idx_all=idx_rounds_all,
-                round_id=r,
-                round_len=round_len,
-                snr_db_signal=snr_db_r,
-                use_counts_pi=False,
-                pi_target=pi_est
-            )
-            Z_full = prep["Z_full"]
-            pi_for_round = prep["pi_round"]
-            Z_round = select_block_from_Z_full(blk, Z_full, round_len)
+            for i in range(0, sparse_vecs.size(0), args.pt_batch_size):
+                x_true_sparse_b = sparse_vecs[i:i+args.pt_batch_size]         # (B,n)
+                K_true_b = K_sparse[i:i+x_true_sparse_b.size(0)]              # (B,)
 
-            # Subset to decode, using same noisy signals as estimated parameters with
-            X_round = test_set[s_loc:e_loc]             # (B_r, n)
+                z_b = model.encode_with_noise(x_true_sparse_b, snr_db=snr_db_r)  # (B,d)
+                x_hat_b, K_final, K_trace, Sigma_trace = model.ampnet(z_b, external_URA_codebook=model.C_syn, pi_round=pi_r, snr_db=None)
 
-            # Use cached (K, sigma^2), 
-            k_last_vals, sig_last_vals, weights = [], [], []
-            K_trace_batches, sigma_trace_batches = [], []
-            round_block_len = X_round.size(0)
+                # Metrics vs sparse vector targets (n-dim)
+                nmse_values.extend(compute_nmse_batch(x_true_sparse_b.cpu().numpy(), x_hat_b.cpu().numpy()))
+                accuracy_values.extend(compute_accuracy_batch(x_true_sparse_b.cpu().numpy(), x_hat_b.cpu().numpy()))
+                pupe_values.extend(compute_pupe_batch(x_true_sparse_b.cpu().numpy(), x_hat_b.cpu().numpy()))
 
-            for offset in range(0, round_block_len, args.pt_batch_size):
-                batch_end = min(offset + args.pt_batch_size, round_block_len)
-                z_b = Z_round[offset:batch_end]                  # (B, d)
-                x_b = X_round[offset:batch_end]                  # (B, n)
+                # Traces for logging
+                B_here = z_b.size(0)
+                K_last.append(float(K_final))  
+                W.append(B_here)
+                Sig_last.append(float(Sigma_trace[-1]))
+                K_tr_all.append(torch.tensor(K_trace, dtype=torch.float32))
+                Sig_tr_all.append(torch.tensor(Sigma_trace, dtype=torch.float32))
 
-                # Use cached per-round params (snr_db=None, K_round=None)
-                x_est_b, k_final, K_trace, sigma_trace = model.ampnet(z_b, model.C_syn, pi_round=pi_for_round, snr_db=None)
-                B_cur = z_b.size(0)
-                k_last_vals.append(float(k_final))
-                sig_last_vals.append(float(sigma_trace[-1]))
-                weights.append(B_cur)
-
-                K_trace_batches.append(torch.tensor(K_trace, dtype=torch.float32))
-                sigma_trace_batches.append(torch.tensor(sigma_trace, dtype=torch.float32))
-                nmse_values.extend(compute_nmse_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
-                accuracy_values.extend(compute_accuracy_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
-                pupe_values.extend(compute_pupe_batch(x_b.detach().cpu().numpy(), x_est_b.detach().cpu().numpy()))
-
-            K_final_round = float(np.average(np.array(k_last_vals), weights=np.array(weights)))
-            sigma2_final_round = float(np.average(np.array(sig_last_vals), weights=np.array(weights)))
-            K_trace_full = torch.stack(K_trace_batches, dim=0).mean(dim=0).tolist()  # For ribbon logging only
-            sigma_trace_full = torch.stack(sigma_trace_batches, dim=0).mean(dim=0).tolist()  # For ribbon logging only
+            # Round summaries
+            K_final_round = float(np.average(np.array(K_last), weights=np.array(W))) if W else float('nan')
+            Sig_final_round = float(np.average(np.array(Sig_last), weights=np.array(W))) if W else float('nan')
+            K_trace_mean = torch.stack(K_tr_all, dim=0).mean(dim=0).tolist() if K_tr_all else []
+            Sig_trace_mean = torch.stack(Sig_tr_all, dim=0).mean(dim=0).tolist() if Sig_tr_all else []
 
             estimation_logs.append({
                 "round_idx": round_idx,
-                "round_size": blk.block_len,
-                "K_true": float(test_K[s_loc].item()),
+                "round_size": sparse_vecs.size(0),
+                "K_true": float(K_sparse[0].item()) if K_sparse.numel() > 0 else float('nan'),
                 "K_final": K_final_round,
-                "sigma2_final": sigma2_final_round,
-                "K_trace": K_trace_full,
-                "sigma_trace": sigma_trace_full,
+                "sigma2_final": Sig_final_round,
+                "K_trace": K_trace_mean,
+                "sigma_trace": Sig_trace_mean,
             })
 
     avg_nmse = float(np.mean(nmse_values)) if nmse_values else float("nan")
-    avg_accuracy = float(np.mean(accuracy_values)) if accuracy_values else float("nan")
+    avg_acc = float(np.mean(accuracy_values)) if accuracy_values else float("nan")
     avg_pupe = float(np.mean(pupe_values)) if pupe_values else float("nan")
 
-    # Logging
-    print("\n=== Parameter Estimation Summary ===")
     print("\n=== Parameter Summary (finals only) ===")
     for log in estimation_logs:
         print(f"Round {log['round_idx']:2d} (N={log['round_size']:4d}): "
-            f"K_true={log['K_true']:5.1f}  K_final={log['K_final']:.3f}  "
-            f"sigma2_final={log['sigma2_final']:.3e}")
-    print(f"\nJoint AMPNet - NMSE: {avg_nmse:.6f}, Accuracy: {avg_accuracy:.6f}")
+              f"K_true={log['K_true']:5.1f}  K_final={log['K_final']:.3f}  "
+              f"sigma2_final={log['sigma2_final']:.3e}")
+    print(f"\nJoint AMPNet - NMSE: {avg_nmse:.6f}, Accuracy: {avg_acc:.6f}")
+
     plot_parameter_traces(estimation_logs, args.save_dir)
-    return avg_nmse, avg_accuracy, avg_pupe
+    return avg_nmse, avg_acc, avg_pupe
 
 
-def compare_decoders(model, test_set, test_K, test_blocks, idx_rounds_all, pi_est_rounds_all, X_all, round_len, args, test_snr_fixed: float | None = None):
-    """
-    Compare methods using the same noisy signals per sample for the entire round.
-    We estimate (K, sigma2) from Z_round and then decode with those cached params.
-    All baselines use the same Z_round slices for fairness.
-    """
+def compare_decoders(model, test_set, test_K, test_blocks, bundle, args, test_snr_fixed: float | None = None):
+    """Compare methods using the same noisy signals per sample for the entire round."""
     model.eval()
-    results_data = {
-        'amp-da-net':    {'nmse': [], 'acc': [], 'pupe': []},
+    results = {
+        'ampnet':    {'nmse': [], 'acc': [], 'pupe': []},
         'ista':      {'nmse': [], 'acc': [], 'pupe': []},
-        'amp-da-net_v1':{'nmse': [], 'acc': [], 'pupe': []},
-        'amp-da':     {'nmse': [], 'acc': [], 'pupe': []},
-        'amp-da-net_v2': {'nmse': [], 'acc': [], 'pupe': []},
+        'post_basic':{'nmse': [], 'acc': [], 'pupe': []},
+        'ampdm':     {'nmse': [], 'acc': [], 'pupe': []},
+        'ampnet_v2': {'nmse': [], 'acc': [], 'pupe': []},
     }
 
-    # Codebook & sensing matrix
-    C_syn = model.C_syn.detach()                  # (n, d)
-    A     = C_syn.t().contiguous()                # (d, n)
-    A_np  = A.detach().cpu().numpy()
-    snr_next_eval = make_snr_sampler(args, stream="test")
-    test_snr_by_round = {}
+    C_syn = model.C_syn.detach()                 # (n,d)
+    A = C_syn.t().contiguous()                   # (d,n) for ISTA
+    A_np = A.cpu().numpy()
+
+    snr_next = make_snr_sampler(args, stream="test")
+    snr_by_round = {}
+    q_cache = {}
 
     with torch.no_grad():
-        for round_idx, blk in enumerate(test_blocks):
-            s_loc, e_loc = blk.local_start, blk.local_end
-            s_glb, e_glb = blk.global_start, blk.global_end
-            r = blk.r_global
+        round_fragments = {}
+        for frag in test_blocks:
+            r = frag.r_global
+            if r not in round_fragments:
+                round_fragments[r] = []
+            round_fragments[r].append(frag)
+        
+        for ridx, r in enumerate(sorted(round_fragments.keys())):
+            frags_in_round = round_fragments[r]
 
-            if test_snr_fixed is not None:
-                snr_db_r = float(test_snr_fixed)
+            snr_db_r = float(test_snr_fixed) if test_snr_fixed is not None else snr_by_round.setdefault(r, snr_next())
+            Q_r, pi_r = get_round_Q_pi(r, q_cache, bundle=bundle, args=args)
+            prepare_round(model, Q_r, bundle["bs_local"][r], pi_r)
+
+            sparse_vecs_round = []
+            K_sparse_round = []
+            
+            for frag in frags_in_round:
+                start, end = frag.local_start, frag.local_end
+                K_a = int(test_K[start].item())
+                
+                device_rows = test_set[start:end]
+                sparse_vec, _ = aggregate_fragment_to_sparse_vector(device_rows, Q_r)
+                
+                sparse_vecs_round.append(sparse_vec)
+                K_sparse_round.append(float(K_a))
+            
+            if len(sparse_vecs_round) == 0:
+                continue
+            
+            sparse_vecs = torch.stack(sparse_vecs_round)
+            K_sparse = torch.tensor(K_sparse_round, device=args.device, dtype=torch.float32)
+            
+            # Batches
+            K_last, W, Sig_last = [], [], []
+            cache_ampnet, cache_z_cs, cache_x_true = [], [], []
+
+            for i in range(0, sparse_vecs.size(0), args.pt_batch_size):
+                x_true_sparse_b = sparse_vecs[i:i+args.pt_batch_size]
+
+                z_b = model.encode_with_noise(x_true_sparse_b, snr_db=snr_db_r)
+
+                x_ampnet_b, k_final, _, sigma_trace = model.ampnet(
+                    z_b, external_URA_codebook=model.C_syn, pi_round=pi_r, snr_db=None
+                )
+                cache_ampnet.append(x_ampnet_b.cpu().numpy())
+                cache_z_cs.append(z_b.cpu().numpy())
+                cache_x_true.append(x_true_sparse_b.cpu().numpy())
+
+                B_here = z_b.size(0)
+                K_last.append(float(k_final)); W.append(B_here)
+                Sig_last.append(float(sigma_trace[-1]))
+
+            if W:
+                K_final_round = float(np.average(np.array(K_last), weights=np.array(W)))
+                Sig_final_round = float(np.average(np.array(Sig_last), weights=np.array(W)))
+                K_int_final = int(round(max(0.0, min(float(model.ampnet.n), K_final_round))))
             else:
-                if r not in test_snr_by_round:
-                    test_snr_by_round[r] = snr_next_eval()
-                snr_db_r = test_snr_by_round[r]
+                K_final_round = Sig_final_round = float('nan'); K_int_final = 0
+            print(f"[Round {ridx}] K_final={K_final_round:.3f} (int {K_int_final}), sigma2_final={Sig_final_round:.3e}")
 
-            X_block  = test_set[s_loc:e_loc]
-            pi_est = pi_est_rounds_all[r]
-
-            prep = prepare_round(
-                model,
-                X_all=X_all,
-                idx_all=idx_rounds_all,
-                round_id=r,
-                round_len=round_len,
-                snr_db_signal=snr_db_r,
-                use_counts_pi=False,
-                pi_target=pi_est
-            )
-            Z_full = prep["Z_full"]
-            pi_est = prep["pi_round"]
-            Z_round = select_block_from_Z_full(blk, Z_full, round_len)
-
-            # Same noisy signals used, slicing converted to offset for batching
-            Z_ampda_block, A_ampda = bernoulli_encode_with_noise(X_block, n=model.ampnet.n, d=model.ampnet.d, snr_db=snr_db_r, device=X_block.device, dtype=X_block.dtype)
-
-            # Runs AMP-DA-Net over all batches, decodes, gathers final K & sigma2
-            K_last_vals, K_last_wts = [], []
-            Sig_last_vals, Sig_last_wts = [], []
-            cache_ampnet_out, cache_z_np, cache_z_ampda, cache_x_true_np = [], [], [], []
-
-            round_block_len = X_block.size(0)
-            for offset in range(0, round_block_len, args.pt_batch_size):
-                batch_end = min(offset + args.pt_batch_size, round_block_len)
-                z_batch       = Z_round[offset:batch_end]
-                z_batch_ampda = Z_ampda_block[offset:batch_end]
-                x_true_b      = X_block[offset:batch_end]
-
-                if z_batch.numel() == 0: # TEMP Gaurd
-                    print(f"[warn] empty batch at offset={offset}, block_len={round_block_len} — skipping")
-                    continue
-
-                x_ampnet_b, k_final, _, sigma_trace = model.ampnet(z_batch, model.C_syn, pi_round=pi_est, snr_db=None)
-                cache_ampnet_out.append(x_ampnet_b.detach().cpu().numpy())
-                cache_z_np.append(z_batch.detach().cpu().numpy())
-                cache_z_ampda.append(z_batch_ampda.detach().cpu().numpy())
-                cache_x_true_np.append(x_true_b.detach().cpu().numpy())
-
-                # final parameters results
-                B_here = z_batch.size(0)
-                K_last_vals.append(float(k_final))
-                K_last_wts.append(B_here)
-                Sig_last_vals.append(float(sigma_trace[-1]))
-                Sig_last_wts.append(B_here)
-
-            # Round-level final scalars
-            K_final_round       = float(np.average(np.array(K_last_vals),  weights=np.array(K_last_wts)))
-            sigma2_final_round  = float(np.average(np.array(Sig_last_vals), weights=np.array(Sig_last_wts)))
-            K_int_final         = int(round(max(0.0, min(float(model.ampnet.n), K_final_round))))
-            print(f"[Round {round_idx}] K_final={K_final_round:.3f} (int {K_int_final}), "
-                  f"sigma2_final={sigma2_final_round:.3e}")
-
-            # Metrics for comparison decoders, using same noisy signals
-            for b in range(len(cache_ampnet_out)):
-                x_ampnet_np = cache_ampnet_out[b]
-                z_np        = cache_z_np[b]
-                z_ampda_np  = cache_z_ampda[b]
-                x_true_np   = cache_x_true_np[b]
-
-                # AMP-DA
-                x_ampda_np = None
-                try:
-                    y_t = torch.from_numpy(z_ampda_np).to(device=args.device, dtype=A_ampda.dtype)
-                    C_t = A_ampda.to(device=args.device, dtype=y_t.dtype)
-                    x_ampda_b, stats = amp_da(y_t, C_t, device=args.device)
-                    x_ampda_np = x_ampda_b.detach().cpu().numpy()
-                    k_est = float(stats["K_count_per_split"].mean().item())
-                    k_int = int(round(k_est))
-                    snr_est_db = 10.0 * math.log10((x_ampda_b @ A_ampda.T).pow(2).mean().item() / float(stats["sigma2"]))
-                    print(f"[Round {round_idx}] AMP-DA: K_est={k_est:.2f}  K_int={k_int}  SNR_est={snr_est_db:.2f} dB")
-                except Exception as e:
-                    print(f"Warning: AMP-DA failed: {e}")
+            for b in range(len(cache_ampnet)):
+                x_ampnet_np = cache_ampnet[b]
+                z_np = cache_z_cs[b]
+                x_true_np = cache_x_true[b]
 
                 B = x_true_np.shape[0]
                 for j in range(B):
-                    # 3) AMP-DA-Net Enhanced
-                    results_data['amp-da-net']['nmse'].append(compute_nmse(x_true_np[j], x_ampnet_np[j]))
-                    results_data['amp-da-net']['acc'].append(compute_accuracy(x_true_np[j], x_ampnet_np[j]))
-                    results_data['amp-da-net']['pupe'].append(compute_pupe(x_true_np[j], x_ampnet_np[j]))
+                    # 1) AMPNet (joint)
+                    results['ampnet']['nmse'].append(compute_nmse(x_true_np[j], x_ampnet_np[j]))
+                    results['ampnet']['acc'].append(compute_accuracy(x_true_np[j], x_ampnet_np[j]))
+                    results['ampnet']['pupe'].append(compute_pupe(x_true_np[j], x_ampnet_np[j]))
 
-                    # 4) ISTA (baseline) with final K
+                    # 2) ISTA on the same z, same A
                     try:
                         x_est_ista = ista(z_np[j], A_np)
-                        results_data['ista']['nmse'].append(compute_nmse(x_true_np[j], x_est_ista))
-                        results_data['ista']['acc'].append(compute_accuracy(x_true_np[j], x_est_ista))
-                        results_data['ista']['pupe'].append(compute_pupe(x_true_np[j], x_est_ista))
+                        results['ista']['nmse'].append(compute_nmse(x_true_np[j], x_est_ista))
+                        results['ista']['acc'].append(compute_accuracy(x_true_np[j], x_est_ista))
+                        results['ista']['pupe'].append(compute_pupe(x_true_np[j], x_est_ista))
                     except Exception as e:
                         print(f"Warning: ISTA failed for sample {j}: {e}")
 
-                    # 5) AMP-DA-Net + Basic post with final K
+                    # 3) AMPNet + basic post (clip, sum-K rounding)
                     try:
-                        x_post_basic = np.clip(x_ampnet_np[j], a_min=0, a_max=None)
-                        x_post_basic = greedy_rounding(x_post_basic, K_int_final)
-                        results_data['amp-da-net_v1']['nmse'].append(compute_nmse(x_true_np[j], x_post_basic))
-                        results_data['amp-da-net_v1']['acc'].append(compute_accuracy(x_true_np[j], x_post_basic))
-                        results_data['amp-da-net_v1']['pupe'].append(compute_pupe(x_true_np[j], x_post_basic))
+                        x_post = np.clip(x_ampnet_np[j], a_min=0, a_max=None)
+                        x_post = greedy_rounding(x_post, K_int_final)
+                        results['post_basic']['nmse'].append(compute_nmse(x_true_np[j], x_post))
+                        results['post_basic']['acc'].append(compute_accuracy(x_true_np[j], x_post))
+                        results['post_basic']['pupe'].append(compute_pupe(x_true_np[j], x_post))
                     except Exception as e:
-                        print(f"Warning: Basic post-processing failed for sample {j}: {e}")
+                        print(f"Warning: Basic post failed for sample {j}: {e}")
 
-                    # 6) AMP-DA
-                    if x_ampda_np is not None:
-                        results_data['amp-da']['nmse'].append(compute_nmse(x_true_np[j], x_ampda_np[j]))
-                        results_data['amp-da']['acc'].append(compute_accuracy(x_true_np[j], x_ampda_np[j]))
-                        results_data['amp-da']['pupe'].append(compute_pupe(x_true_np[j], x_ampda_np[j]))
-
-                    # 7) AMP-DA-Net + advanced post with final K
+                    # 4) AMPNet + advanced post
                     try:
                         x_adv = top_k_nonneg(x_ampnet_np[j], K_int_final)
                         x_adv = l2_refit_on_support(z_np[j], A_np, x_adv, ridge=1e-6, nonneg=True)
                         x_adv = greedy_rounding(x_adv, K_int_final)
-                        results_data['amp-da-net_v2']['nmse'].append(compute_nmse(x_true_np[j], x_adv))
-                        results_data['amp-da-net_v2']['acc'].append(compute_accuracy(x_true_np[j], x_adv))
-                        results_data['amp-da-net_v2']['pupe'].append(compute_pupe(x_true_np[j], x_adv))
+                        results['ampnet_v2']['nmse'].append(compute_nmse(x_true_np[j], x_adv))
+                        results['ampnet_v2']['acc'].append(compute_accuracy(x_true_np[j], x_adv))
+                        results['ampnet_v2']['pupe'].append(compute_pupe(x_true_np[j], x_adv))
                     except Exception as e:
-                        print(f"Warning: Advanced post-processing failed for sample {j}: {e}")
+                        print(f"Warning: Advanced post failed for sample {j}: {e}")
 
-    # Display results
+                # 5) AMP-DM (uses sparse vectors with Bernoulli encoding)
+                try:
+                    Z_ampdm, A_ampdm = bernoulli_encode_with_noise(
+                        sparse_vecs.to(args.device), n=model.ampnet.n, d=model.ampnet.d, snr_db=snr_db_r,
+                        device=args.device, dtype=sparse_vecs.dtype
+                    )
+                    x_ampdm_b, stats = amp_da(Z_ampdm, A_ampdm, device=args.device)
+                    xa = x_ampdm_b.cpu().numpy(); xt = sparse_vecs.cpu().numpy()
+                    for j in range(xa.shape[0]):
+                        results['ampdm']['nmse'].append(compute_nmse(xt[j], xa[j]))
+                        results['ampdm']['acc'].append(compute_accuracy(xt[j], xa[j]))
+                        results['ampdm']['pupe'].append(compute_pupe(xt[j], xa[j]))
+                except Exception as e:
+                    print(f"Warning: AMP-DM baseline failed on round {ridx}: {e}")
+
     print("\n" + "="*75)
     print(f"{'Method':<25}{'NMSE':<20}{'Accuracy':<20}{'PUPE':<20}")
     print("-"*75)
-
-    methods = {
-        'amp-da-net': 'Joint AMP-DA-Net',
-        'ista': 'ISTA',
-        'amp-da-net_v1': 'AMP-DA-Net + Basic Post',  # Non-negative + greedy rounding
-        'amp-da': 'AMP-DA',
-        'amp-da-net_v2': 'AMP-DA-Net + Adv Post',  # Non-negative + TopK + l2 refit + greedy rounding (found to be more consistent overall)
-    }
-    
-    # Calculate and display averages
     results_avg = {}
-    for method, name in methods.items():
-        data = results_data[method]
+    names = {
+        'ampnet': 'Joint AMPNet',
+        'ista': 'Basic ISTA',
+        'post_basic': 'AMPNet + Basic Post',
+        'ampdm': 'AMP-DM (Bernoulli A)',
+        'ampnet_v2': 'AMPNet + Adv Post',
+    }
+    for key, label in names.items():
+        data = results[key]
         if data['nmse']:
-            nmse_avg = np.mean(data['nmse'])
-            acc_avg = np.mean(data['acc'])
-            pupe_avg = np.mean(data['pupe'])
-            print(f"{name:<25}{nmse_avg:.6f}{'':<13}{acc_avg:.6f}{'':<13}{pupe_avg:.6f}")
-            results_avg[method] = (nmse_avg, acc_avg, pupe_avg)
+            nmse = np.mean(data['nmse']); acc = np.mean(data['acc']); pupe = np.mean(data['pupe'])
+            print(f"{label:<25}{nmse:.6f}{'':<13}{acc:.6f}{'':<13}{pupe:.6f}")
+            results_avg[key] = (nmse, acc, pupe)
         else:
-            results_avg[method] = (None, None, None)
-            print(f"{name:<25}{'N/A':<20}{'N/A':<20}{'N/A':<20}")
+            print(f"{label:<25}{'N/A':<20}{'N/A':<20}{'N/A':<20}")
+            results_avg[key] = (None, None, None)
     print("="*75)
     
-    best_method = None
-    best_acc = -1
-    for method, (_, acc, _) in results_avg.items():
+    best_key, best_acc = None, -1
+    for k, (_, acc, _) in results_avg.items():
         if acc is not None and acc > best_acc:
-            best_acc = acc
-            best_method = method
-    if best_method:
-        print(f"\nBest method: {methods[best_method]} with accuracy: {best_acc:.6f}")
+            best_key, best_acc = k, acc
+    if best_key:
+        print(f"\nBest method: {names[best_key]} with accuracy: {best_acc:.6f}")
     return results_avg
 
 
+def save_codebook_analysis_artifacts(metrics, args, *, codebook_pt_path: str | None = None, plot_path: str | None = None, base_name: str = "codebook_analysis"):
+    """Save analysis so plots can be fully recreated."""
+    summ_dir = os.path.join(args.save_dir, "summaries")
+    os.makedirs(summ_dir, exist_ok=True)
+
+    arrays = metrics.get("_arrays", {})
+    arrays_to_save = {}
+    for key in ["G", "S", "rip_deltas", "G_hist_counts", "G_hist_edges"]:
+        if key in arrays and arrays[key] is not None:
+            arrays_to_save[key] = np.asarray(arrays[key])
+
+    npz_path = os.path.join(summ_dir, f"{base_name}_arrays.npz")
+    if arrays_to_save:
+        np.savez_compressed(npz_path, **arrays_to_save)
+    else:
+        npz_path = None
+
+    codebook_sha1 = None
+    try:
+        if "decoder_model" in globals():
+            codebook_sha1 = _sha1_tensor(decoder_model.C_syn.data.clone())
+    except Exception:
+        pass
+
+    scalars = metrics.get("_scalars", {})
+    cc_percentiles = metrics.get("_cc_percentiles", {})
+    cfg = metrics.get("_config", {})
+    basic = metrics.get("_basic", {})
+
+    json_payload = {
+        "metric_source": "codebook_analysis",
+        "version": 1,
+        "dimensions": metrics.get("dimensions"),
+        "basic": basic,
+        "config": cfg,
+        "scalars": scalars,
+        "cc_percentiles": cc_percentiles,
+        "rip_quality": metrics.get("rip_quality", None),
+        "files": {
+            "arrays_npz": (None if npz_path is None else os.path.relpath(npz_path, args.save_dir)),
+            "plot_path": (None if plot_path is None else os.path.relpath(plot_path, args.save_dir)),
+            "codebook_pt": (None if not codebook_pt_path else os.path.relpath(codebook_pt_path, args.save_dir)),
+        },
+        "codebook_sha1": codebook_sha1,
+        "context": run_manifest(args),
+    }
+    save_json(json_payload, os.path.join(summ_dir, f"{base_name}.json"))
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Wireless Federated Learning with AMP-DA-Net Compression")
+    parser = argparse.ArgumentParser(description="Wireless Federated Learning with AMPNet Compression")
     
     # === Pretraining Parameters ===
-    parser.add_argument('--train-size',         type=int,   default=4000, help="number of training samples")
-    parser.add_argument('--valid-size',         type=int,   default=1000, help="number of validation samples")
-    parser.add_argument('--test-size',          type=int,   default=1000, help="number of test samples")
-    parser.add_argument('--num-test-rounds',    type=int,   default=1, help="number of rounds used in test set")
-    parser.add_argument('--pt-epochs',          type=int,   default=1, help="pretraining epochs")
-    parser.add_argument('--pt-batch-size',      type=int,   default=16, help="training batch size")
-    parser.add_argument('--pt-patience',        type=int,   default=5, help="early-stop patience")
-    parser.add_argument('--pt-delta',           type=float, default=1e-6, help="min val-loss improvement to reset patience")
-    parser.add_argument('--sched-patience',     type=int,   default=5, help="scheduler patience")
-    parser.add_argument('--sched-factor',       type=float, default=0.5, help="scheduler factor")
+    parser.add_argument('--pt-epochs', type=int, default=2, help="pretraining epochs")
+    parser.add_argument('--pt-batch-size', type=int, default=16, help="training batch size")
+    parser.add_argument('--pt-patience', type=int, default=5, help="early-stop patience")
+    parser.add_argument('--pt-delta', type=float, default=1e-6, help="min val-loss improvement to reset patience")
+    parser.add_argument('--sched-patience', type=int, default=5, help="scheduler patience")
+    parser.add_argument('--sched-factor', type=float, default=0.5, help="scheduler factor")
 
     # === Dataset Selection (slug/path) ===
-    parser.add_argument('--dataset-dir',        type=str, default="runs/datasets/iFed_datasets", help="Directory containing iFed .pth bundles")
-    parser.add_argument('--dataset-path',       type=str, default="", help="Exact path to a .pth dataset (overrides slug)")
-    parser.add_argument('--dataset-slug',       type=str, default="", help="Optional slug override (fuzzy match allowed)")
-    parser.add_argument('--code-order',         type=str, default="pop", choices=["none", "spectral", "spectral_pop", "pop"], help="Ordering used during collection (embedded in dataset)")
-    parser.add_argument('--model',              type=str, default='resnet', choices=['resnet', 'cifarcnn', 'custom'], help="Model tag used during collection (affects slug)")
-    parser.add_argument('--custom-model',       type=str, default='', help="For --model custom: 'module.path:ClassName'")
-    parser.add_argument('--custom-kwargs',      type=str, default='{}', help='JSON dict of ctor kwargs for --model custom')
-    parser.add_argument('--within-round',       type=str, default="random", choices=["prefix", "contig_rand", "random"], help="Sampling strategy within each round")
+    parser.add_argument('--dataset-dir', type=str, default="runs/datasets/iFed_datasets", help="Directory containing iFed .pth bundles")
+    parser.add_argument('--dataset-path', type=str, default="", help="Exact path to a .pth dataset (overrides slug)")
+    parser.add_argument('--dataset-slug', type=str, default="", help="Optional slug override (fuzzy match allowed)")
+    parser.add_argument('--code-order', type=str, default="pop", choices=["none", "spectral", "spectral_pop", "pop"], help="Codebook ordering strategy")
+    parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'smallvgg', 'custom'], help="Model tag used during collection (affects slug)")
+    parser.add_argument('--custom-model', type=str, default='', help="For --model custom: 'module.path:ClassName'")
+    parser.add_argument('--custom-kwargs', type=str, default='{}', help='JSON dict of ctor kwargs for --model custom')
+    parser.add_argument('--within-round', type=str, default="random", choices=["prefix", "contig_rand", "random"], help="Sampling strategy within each round")
 
-    # === Dataset Parameters ===
-    parser.add_argument('--frac-random',        type=float, default=0.2, help="fraction of random samples per device")
-    
     # === Federated Learning Parameters ===
-    parser.add_argument('--K-t',                type=int, default=40, help="total number of devices") # Make sure is a factor of 50,000
-    parser.add_argument('--min-p',              type=int, default=2, help="minimum participants per round")
-    parser.add_argument('--max-p',              type=int, default=2, help="maximum participants per round")
+    parser.add_argument('--K-t', type=int, default=40, help="total number of devices")
+    parser.add_argument('--min-p', type=int, default=2, help="minimum participants per round")
+    parser.add_argument('--max-p', type=int, default=2, help="maximum participants per round")
     
     # === Wireless Channel & Compressor Parameters ===
-    parser.add_argument('--message-split',      type=int, default=10, help="message split size & quantization dimension")
-    parser.add_argument('--n',                  type=int, default=256, help="number of codewords in codebooks")
-    parser.add_argument('--dim',                type=int, default=64, help="encoding dimension")
-    parser.add_argument('--snr-db',             type=float, default=20, help="fixed SNR used when --snr-mode=fixed")
-    parser.add_argument('--snr-mode',           type=str, default='range', choices=['fixed','range'], help="Use a single fixed SNR for the whole run, or sample new per-round SNRs within each epoch.")
-    parser.add_argument('--snr-min-db',         type=float, default=0.0, help="Lower bound (dB) when --snr-mode=range.")
-    parser.add_argument('--snr-max-db',         type=float, default=20.0, help="Upper bound (dB) when --snr-mode=range.")
-    parser.add_argument('--test-snrs',          type=str, default='20,15,10,5,3', help="Comma-separated SNR(dB) list for test-time ISTA comparison, e.g. '20,15,10,5,3'. Empty = use snr-mode.")
+    parser.add_argument('--message-split', type=int, default=10, help="message split size & quantization dimension")
+    parser.add_argument('--n', type=int, default=256, help="number of codewords in codebooks")
+    parser.add_argument('--dim', type=int, default=64, help="encoding dimension")
+    parser.add_argument('--snr-db', type=float, default=20, help="fixed SNR used when --snr-mode=fixed")
+    parser.add_argument('--snr-mode', type=str, default='range', choices=['fixed', 'range'], help="Use a single fixed SNR for the whole run, or sample new per-round SNRs within each epoch.")
+    parser.add_argument('--snr-min-db', type=float, default=0.0, help="Lower bound (dB) when --snr-mode=range.")
+    parser.add_argument('--snr-max-db', type=float, default=20.0, help="Upper bound (dB) when --snr-mode=range.")
+    parser.add_argument('--test-snrs', type=str, default='20,15,10,5,3,0', help="Comma-separated SNR(dB) list for test-time comparison")
 
-    # === AMP-DA-Net Parameters ===
-    parser.add_argument('--num-layers',         type=int, default=10, help="number of AMP-DA-Net layers")
-    parser.add_argument('--num-filters',        type=int, default=32, help="number of filters in AMP-DA-Net")
-    parser.add_argument('--kernel-size',        type=int, default=3, help="kernel size in AMP-DA-Net")
-    parser.add_argument('--use-poisson',        action=argparse.BooleanOptionalAction, default=True, help="Use spike+Poisson counts prior (use --no-use-poisson for uniform counts)")
-    parser.add_argument('--update-alpha',       action=argparse.BooleanOptionalAction, default=True, help="Enable per-layer alpha prior-posterior mixing")
-    parser.add_argument('--learn-sigma2',       action=argparse.BooleanOptionalAction, default=True, help="Enable σ² EM head for noise-variance updates.")
-    parser.add_argument('--finetune-K',         action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of K per layer.")
-    parser.add_argument('--finetune-pi',        action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of π per layer.")
-    parser.add_argument('--finetune-sigma2',    action=argparse.BooleanOptionalAction, default=True, help="Blend σ² via learned step size (requires --learn-sigma2).")
-    parser.add_argument('--per-sample-sigma',   action=argparse.BooleanOptionalAction, default=True, help="Track per-sample σ² (B,1) instead of a scalar.")
-    parser.add_argument('--per-sample-alpha',   action=argparse.BooleanOptionalAction, default=False, help="Use per-sample alpha instead of batch-averaged alpha.")
-    parser.add_argument('--K-max',              type=int, default=-1, help="Fixed discrete prior cap K_max (≤ n) -1 represents adaptive (2*Ka)")
-    parser.add_argument('--blend-init',         type=float, default=0.85, help="Initial CNN blend weight in (0,1) for m1-CNN")
+    # === AMPNet Parameters ===
+    parser.add_argument('--num-layers', type=int, default=10, help="number of AMPNet layers")
+    parser.add_argument('--num-filters', type=int, default=32, help="number of filters in AMPNet")
+    parser.add_argument('--kernel-size', type=int, default=3, help="kernel size in AMPNet")
+    parser.add_argument('--use-poisson', action=argparse.BooleanOptionalAction, default=True, help="Use spike+Poisson counts prior")
+    parser.add_argument('--update-alpha', action=argparse.BooleanOptionalAction, default=True, help="Enable per-layer alpha prior-posterior mixing")
+    parser.add_argument('--learn-sigma2', action=argparse.BooleanOptionalAction, default=True, help="Enable σ² EM head for noise-variance updates.")
+    parser.add_argument('--finetune-K', action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of K per layer.")
+    parser.add_argument('--finetune-pi', action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of π per layer.")
+    parser.add_argument('--finetune-sigma2', action=argparse.BooleanOptionalAction, default=True, help="Blend σ² via learned step size.")
+    parser.add_argument('--per-sample-sigma', action=argparse.BooleanOptionalAction, default=True, help="Track per-sample σ² (B,1) instead of a scalar.")
+    parser.add_argument('--per-sample-alpha', action=argparse.BooleanOptionalAction, default=False, help="Use per-sample alpha instead of batch-averaged alpha.")
+    parser.add_argument('--K-max', type=int, default=-1, help="Fixed discrete prior cap K_max (≤ n) -1 represents adaptive (2*Ka)")
+    parser.add_argument('--blend-init', type=float, default=0.85, help="Initial CNN blend weight in (0,1) for m1-CNN")
 
-    # === URA Codebook Options (fixed vs learned) ===
-    parser.add_argument('--codebook-trainable', action=argparse.BooleanOptionalAction, default=True, help="Train the URA codebook (C,W). Use --no-codebook-trainable to freeze")
-    parser.add_argument('--codebook-init',      type=str, default='gaussian', choices=['q_init', 'gaussian', 'bernoulli'], help="Initializer for URA codebook when frozen or at t=0 (unit-norm rows)")
+    # === URA & Quant Codebook Options ===
+    parser.add_argument('--codebook-trainable', action=argparse.BooleanOptionalAction, default=True, help="Train the URA codebook (C,W)")
+    parser.add_argument('--codebook-init', type=str, default='gaussian', choices=['q_init', 'gaussian', 'bernoulli'], help="Initializer for URA codebook")
+    parser.add_argument('--quant-type', type=str, default='kmeans_plusplus', choices=['kmeans_plusplus'], help='Quantizer type for per-round fragment quantization')
+    parser.add_argument('--kmeans-max-iter', type=int, default=0, help="Max Lloyd iterations for K-means (0 = just k-means++ seeds)")
+    parser.add_argument('--curv-mode', type=str, default='none', choices=['none', 'diagonal_hessian_proxy', 'data_whitening'], help="Curvature-aware codebook creation mode")
+    parser.add_argument('--curv-max-samples', type=int, default=10000, help="Max samples for curvature estimation")
+    parser.add_argument('--curv-eps', type=float, default=1e-6, help="Regularization epsilon for curvature methods")
 
     # === Compressor Training Parameters ===
-    parser.add_argument('--amp-lr',             type=float, default=0.0001, help="compressor learning rate")
-    parser.add_argument('--lambda-sparse',      type=float, default=0.001, help="sparsity regularization weight")
-    parser.add_argument('--lambda-w',           type=float, default=0.001, help="W matrix regularization weight")
-    parser.add_argument('--lambda-k',           type=float, default=0.01, help="K active device loss weight")
+    parser.add_argument('--amp-lr', type=float, default=0.0001, help="compressor learning rate")
+    parser.add_argument('--lambda-sparse', type=float, default=0.001, help="sparsity regularization weight")
+    parser.add_argument('--lambda-w', type=float, default=0.001, help="W matrix regularization weight")
+    parser.add_argument('--lambda-k', type=float, default=0.01, help="K active device loss weight")
+    parser.add_argument('--lambda-q', type=float, default=0.0, help='Quantization penalty weight')
 
     # === Training Control & System ===
-    parser.add_argument('--ckpt-dir',           type=str, default="runs/checkpoints/pretrain", help="directory to save pretrained decoder & codebook (separate from --save-dir)")
-    parser.add_argument('--save-dir',           type=str, default="runs/results/pretrain", help="directory to save results")
-    parser.add_argument('--seed',               type=int, default=42, help="random seed")
+    parser.add_argument('--ckpt-dir', type=str, default="runs/checkpoints/pretrain", help="directory to save pretrained decoder & codebook")
+    parser.add_argument('--save-dir', type=str, default="runs/results/pretrain", help="directory to save results")
+    parser.add_argument('--seed', type=int, default=42, help="random seed")
 
     args = parser.parse_args()
 
@@ -924,61 +969,20 @@ if __name__ == "__main__":
         print("GPU not available, using CPU")
 
     # Load dataset
-    bundle_path, X_all, K_rounds_all, pi_targets_rounds_all, pi_est_rounds_all, idx_rounds_all, R, round_len = load_ifed_from_args(args, args.device)
-    train_round_ids, valid_round_ids, test_round_ids = split_round_ids(R, args)
-    args.bundle_path = bundle_path
-
-    train_X, train_K, train_blocks = build_split(
-        X_all, K_rounds_all, 
-        wanted_samples=args.train_size,
-        R=R, 
-        round_len=round_len,
-        batch_size=args.pt_batch_size,
-        shuffle_rounds=True,
-        max_batches_per_round=None,
-        round_pool=train_round_ids,
-        within_round=args.within_round,
-    )
-    valid_X, valid_K, valid_blocks = build_split(
-        X_all, K_rounds_all,
-        wanted_samples=args.valid_size,
-        R=R, 
-        round_len=round_len,
-        batch_size=args.pt_batch_size,
-        shuffle_rounds=True,
-        max_batches_per_round=None,
-        round_pool=valid_round_ids,
-        within_round=args.within_round,
-    )
-    test_X, test_K, test_blocks = build_split(
-        X_all, K_rounds_all,
-        wanted_samples=args.test_size,
-        R=R,
-        round_len=round_len,
-        batch_size=args.pt_batch_size,
-        shuffle_rounds=False,
-        max_batches_per_round=None,
-        round_pool=test_round_ids,
-        within_round=args.within_round, # Maybe not necessary to do it in test set
-    )
-    print("Chosen test rounds:", test_round_ids)
-    print(f"Dataset splits  train={train_X.size(0)}  valid={valid_X.size(0)}  test={test_X.size(0)}")
+    (train_X, train_K, train_blocks, 
+     valid_X, valid_K, valid_blocks,
+     test_X, test_K, test_blocks, bundle) = load_raw_splits(args, args.device)
 
     # Pretraining
     decoder_model, pt_stats = pre_train_decoder(
-        train_X, train_K, train_blocks, valid_X, valid_K, valid_blocks,
-        X_all, idx_rounds_all, pi_est_rounds_all, round_len, args
+        train_X, train_K, train_blocks,
+        valid_X, valid_K, valid_blocks,
+        bundle, args
     )
-
-    if args.device.type == 'cuda':
-        torch.cuda.empty_cache()
-        gc.collect()
 
     print("\nEvaluating pre-trained model on test set...")
     avg_nmse, avg_accuracy, avg_pupe = evaluate_model(
-        decoder_model, test_X, test_K, test_blocks,
-        idx_rounds_all, pi_est_rounds_all, pi_targets_rounds_all,
-        X_all, round_len, args
+        decoder_model, test_X, test_K, test_blocks, bundle, args
     )
 
     print("\nComparing decoders...")
@@ -990,60 +994,47 @@ if __name__ == "__main__":
         all_results_by_snr = {}
         for snr in snr_list:
             print(f"\n[compare_decoders @ {snr:.1f} dB]")
-            res = compare_decoders(
-                decoder_model, test_X, test_K, test_blocks,
-                idx_rounds_all, pi_est_rounds_all,
-                X_all, round_len, args,
-                test_snr_fixed=snr
-            )
+            res = compare_decoders(decoder_model, test_X, test_K, test_blocks, bundle, args, test_snr_fixed=snr)
             all_results_by_snr[f"{snr:.1f}dB"] = res
         save_json(all_results_by_snr, os.path.join(summ_dir, "compare_decoders_by_snr.json"))
-        pick_key = f"{snr_list[0]:.1f}dB"
-        results_avg = all_results_by_snr[pick_key]
+        results_avg = all_results_by_snr[f"{snr_list[0]:.1f}dB"]
     else:
-        results_avg = compare_decoders(
-            decoder_model, test_X, test_K, test_blocks,
-            idx_rounds_all, pi_est_rounds_all,
-            X_all, round_len, args
-        )
+        results_avg = compare_decoders(decoder_model, test_X, test_K, test_blocks, bundle, args)
 
-    # Persist JSON artifacts (finals + losses)
-    summ_dir = os.path.join(args.save_dir, "summaries")
-    os.makedirs(summ_dir, exist_ok=True)
-
-    # 1) Minimal “finals” for logging 
-    ampnet_raw       = _triplet_to_dict(results_avg, 'amp-da-net')
-    ampnet_basic     = _triplet_to_dict(results_avg, 'amp-da-net_v1')
-    ampnet_adv       = _triplet_to_dict(results_avg, 'amp-da-net_v2')
-    ista_basic       = _triplet_to_dict(results_avg, 'ista')
-    amp_da_baseline  = _triplet_to_dict(results_avg, 'amp-da')
+    # Persist JSON artifacts
+    ampnet_raw = _triplet_to_dict(results_avg, 'ampnet')
+    ampnet_basic = _triplet_to_dict(results_avg, 'post_basic')
+    ampnet_adv = _triplet_to_dict(results_avg, 'ampnet_v2')
+    ista_basic = _triplet_to_dict(results_avg, 'ista')
+    ampdm_baseline = _triplet_to_dict(results_avg, 'ampdm')
 
     finals = dict(
-        metric_source="pretrain",
+        metric_source="pretrain_eval",
         final_val_loss=pt_stats["best_val_loss"],
-
-        # raw AMPNet from evaluate_model
         final_nmse=avg_nmse,
         final_acc=avg_accuracy,
         final_pupe=avg_pupe,
-
-        # structured per-method blocks
         ampnet_raw=ampnet_raw,
         ampnet_post_basic=ampnet_basic,
         ampnet_post_adv=ampnet_adv,
         ista=ista_basic,
-        ampda=amp_da_baseline,
+        ampdm=ampdm_baseline,
+        snr_mode=str(getattr(args, "snr_mode", "fixed")).lower(),
+        snr_db=getattr(args, "snr_db", None),
+        snr_range=[getattr(args, "snr_min_db", None), getattr(args, "snr_max_db", None)],
+        code_order=str(getattr(args, "code_order", "")),
+        within_round=str(getattr(args, "within_round", "prefix")).lower(),
+        decoder_pth=pt_stats.get("decoder_pth"),
+        codebook_pt=pt_stats.get("codebook_pt"),
     )
     save_json(finals, os.path.join(summ_dir, "final_metrics.json"))
-
-    # 2) Loss curves for later re-plots & JSONL info for later aggregation across experiments
     save_json(dict(train=pt_stats["train_losses"], valid=pt_stats["val_losses"]), os.path.join(summ_dir, "loss_curves.json"))
     append_jsonl({**run_manifest(args), **finals}, os.path.join(summ_dir, "runs.jsonl"))
 
     # Cleanup
     if args.device.type == 'cuda':
         torch.cuda.empty_cache()
-        gc.collect()
+    gc.collect()
 
     # Save results
     os.makedirs(args.save_dir, exist_ok=True)
@@ -1051,7 +1042,10 @@ if __name__ == "__main__":
     print(f"Training completed. Results saved to {args.save_dir}")
 
     # Analyse final models & codebooks
-    analysis_fig_path = os.path.join(args.save_dir, "codebook_analysis", "codebook_analysis.png")
+    analysis_dir = os.path.join(args.save_dir, "codebook_analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+    analysis_fig_path = os.path.join(analysis_dir, "codebook_analysis.png")
+    
     URA_codebook_metrics = analyse_codebook(
         decoder_model.C_syn.data.clone().T,
         plot=True,

@@ -24,10 +24,17 @@ def make_decoder_slug(args):
         snr = f"snrU[{_fmt_float(args.snr_min_db,0)}-{_fmt_float(args.snr_max_db,0)}]dB"
     else:
         snr = f"snr{_fmt_float(float(args.snr_db),1)}dB"
-    split = f"split-{str(getattr(args, 'within_round', 'prefix')).lower()}"  # NEW
+    k_range = f"p({int(args.min_p)}-{int(args.max_p)})"
+    split = f"split-{str(getattr(args, 'within_round', 'prefix')).lower()}"
     cbinit  = f"cbinit-{str(args.codebook_init).lower()}"
     cbtrain = f"cbtrain-{int(bool(args.codebook_trainable))}"
-    return f"{core}_{arch}_{opts}_{snr}_{split}_{cbinit}_{cbtrain}_seed{int(args.seed)}"  # NEW: split in slug
+    km_tag = f"kmiter{int(getattr(args, 'kmeans_max_iter', 0))}"
+    curv_tag = f"curv-{str(getattr(args, 'curv_mode', 'none')).lower()}"
+    quant_tag = f"qtype-{str(getattr(args, 'quant_type', 'kmeans_plusplus')).lower()}"
+    qloss_tag = f"qloss{_fmt_float(float(getattr(args, 'lambda_q', 0.0)), 4)}"
+    agg_tag = f"agg-{str(getattr(args, 'agg_method', 'average')).lower()}"
+    
+    return f"{core}_{arch}_{opts}_{snr}_{k_range}_{split}_{cbinit}_{cbtrain}_{km_tag}_{curv_tag}_{quant_tag}_{qloss_tag}_{agg_tag}_seed{int(args.seed)}"
 
 def _sha1_tensor(t: torch.Tensor) -> str:
     b = t.detach().to("cpu", dtype=torch.float32).contiguous().numpy().tobytes()
@@ -69,7 +76,7 @@ def save_pretrained_artifacts(model, args):
             "snr_max_db": float(getattr(args,"snr_max_db", 20.0)),
             "dataset_basename": os.path.basename(getattr(args, "bundle_path", "")),
             "saved_with_seed": int(args.seed),
-            "within_round": str(getattr(args, "within_round", "prefix")).lower(),  # NEW
+            "within_round": str(getattr(args, "within_round", "prefix")).lower(),
             # AMPNet toggles (kept out of filename, but preserved here)
             "use_poisson": bool(model.ampnet.use_poisson),
             "update_alpha": bool(model.ampnet.update_alpha),
@@ -85,6 +92,12 @@ def save_pretrained_artifacts(model, args):
             "codebook_init": str(args.codebook_init).lower(),
             "codebook_trainable": bool(args.codebook_trainable),
             "codebook_sha1": cb_sha1,  # codebook fingerprint
+            # Journal extension parameters
+            "kmeans_max_iter": int(getattr(args, "kmeans_max_iter", 0)),
+            "curv_mode": str(getattr(args, "curv_mode", "none")).lower(),
+            "quant_type": str(getattr(args, "quant_type", "kmeans_plusplus")).lower(),
+            "lambda_q": float(getattr(args, "lambda_q", 0.0)),
+            "agg_method": str(getattr(args, "agg_method", "average")).lower(),
         }
     }
 
@@ -109,6 +122,11 @@ def save_pretrained_artifacts(model, args):
             "paired_decoder": os.path.basename(decoder_pth),
             "codebook_init": str(args.codebook_init).lower(),
             "codebook_trainable": bool(args.codebook_trainable),
+            # Journal extension parameters
+            "kmeans_max_iter": int(getattr(args, "kmeans_max_iter", 0)),
+            "curv_mode": str(getattr(args, "curv_mode", "none")).lower(),
+            "quant_type": str(getattr(args, "quant_type", "kmeans_plusplus")).lower(),
+            "lambda_q": float(getattr(args, "lambda_q", 0.0)),
         }, f, indent=2)
 
     print(f"[save] Decoder  → {decoder_pth}")

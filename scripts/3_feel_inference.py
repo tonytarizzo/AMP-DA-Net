@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from sklearn.cluster import kmeans_plusplus
 
 from src.analysis import (
     error_feedback_info,
@@ -24,7 +23,7 @@ from src.analysis import (
     save_round_history_csv,
     run_manifest,
 )
-from src.codebooks import get_round_perm
+from src.codebooks import get_round_perm, create_quantisation_codebook
 from src.datasets import load_cifar_datasets
 from src.decoding import (
     AMPNet1DEnhanced,
@@ -43,6 +42,82 @@ from src.utils import (
 )
 
 
+def corrupt_deltas(deltas: torch.Tensor, corruption_frac: float, seed: int = None) -> torch.Tensor:
+    """Apply pre-communication message corruption to a fraction of devices per compression (excluding base station)."""
+    if corruption_frac <= 0.0:
+        return deltas
+    
+    K_a = deltas.size(0)
+    if K_a <= 1: # Cannot corrupt if only base station or no devices
+        return deltas
+    num_corrupt = max(1, int(corruption_frac * (K_a - 1)))  # Excludes base station
+    
+    if seed is not None:
+        g = torch.Generator(device=deltas.device).manual_seed(seed)
+    else:
+        g = None
+    
+    # Select devices to corrupt
+    available_indices = torch.arange(1, K_a, device=deltas.device)
+    perm = torch.randperm(len(available_indices), generator=g, device=deltas.device)
+    corrupt_idx = available_indices[perm[:min(num_corrupt, len(available_indices))]]
+    
+    # Corruption strategy: add noise with -6 dB SNR
+    deltas_out = deltas.clone()
+    for idx in corrupt_idx:
+        delta_1d = deltas_out[idx]  # (D,)
+        snr_lin = 10 ** (-6.0 / 10.0)  # -6 dB SNR
+        P_signal = delta_1d.pow(2).mean()
+        noise_std = (P_signal / snr_lin).sqrt()
+        deltas_out[idx] = delta_1d + torch.randn_like(delta_1d, generator=g) * noise_std
+    
+    return deltas_out
+
+
+def aggregate_sparse_vectors(target_vectors: torch.Tensor, method: str = "average", 
+                             trim_frac: float = 0.1) -> torch.Tensor:
+    """Aggregate sparse vectors from all splits using specified method."""
+    if method == "average":
+        # Default average across all counts
+        return target_vectors.float()
+    
+    elif method == "majority_voting":
+        # Majority voting: keep only the most common codeword per split
+        S, n = target_vectors.shape
+        result = torch.zeros_like(target_vectors, dtype=torch.float32)
+        
+        for s in range(S):
+            # Find which codewords were selected
+            counts = target_vectors[s]  # (n,)
+            if counts.sum() > 0:
+                # Keep only the most common codeword
+                max_idx = torch.argmax(counts)
+                result[s, max_idx] = counts[max_idx].float()
+        return result
+    
+    elif method == "trimmed_mean":
+        # Trimmed mean: for each codeword, trim extreme counts
+        S, n = target_vectors.shape
+        result = torch.zeros_like(target_vectors, dtype=torch.float32)
+        
+        for j in range(n):
+            col = target_vectors[:, j].float()  # (S,)
+            # Only consider non-zero entries for trimming
+            nonzero_mask = col > 0
+            if nonzero_mask.sum() >= 3:
+                values = col[nonzero_mask]
+                k_trim = max(1, int(len(values) * trim_frac))
+                sorted_vals, _ = torch.sort(values)
+                trimmed = sorted_vals[k_trim:-k_trim] if len(sorted_vals) > 2*k_trim else sorted_vals
+                result[nonzero_mask, j] = trimmed.mean() if len(trimmed) > 0 else values.mean()
+            else:
+                result[:, j] = col
+        return result
+    
+    else:
+        raise ValueError(f"Unknown aggregation method: {method}")
+
+
 class WirelessCompressor(nn.Module):
     def __init__(self, args, device):
         super().__init__()
@@ -50,6 +125,8 @@ class WirelessCompressor(nn.Module):
         self.device = device
         self.grad_accumulation_size = int(args.grad_accumulation_size)
         self.post_rounding = bool(args.post_rounding)
+        self.agg_method = str(getattr(args, 'agg_method', 'average')).lower()
+        self.trim_frac = float(getattr(args, 'trim_frac', 0.1))
 
         # 1) Load pretrained AMPNet & URA codebook
         amp_state, meta, C_nt, dec_pth, cb_pt = load_pretrained_pair(args, device)
@@ -128,7 +205,7 @@ class WirelessCompressor(nn.Module):
             out.append(torch.tensor(xk, device=X_raw.device, dtype=X_raw.dtype))
         return torch.stack(out, dim=0)
 
-    def decode_round(self, y, S, target_vectors, pi_est, idx_mini, K_a, k_agg="mean", trim=0.0, z_clean=None):
+    def decode_round(self, y, S, target_vectors, pi_est, idx_mini, K_a, z_clean=None):
         """
         Decodes one round with AMP-DA-Net using cached per-round parameters.
         Returns: recovered_flat, amp_loss (placeholder=0.0), K_est_final, acc, pupe, sigma2_final, snr_final_db
@@ -177,10 +254,13 @@ class WirelessCompressor(nn.Module):
         else:
             X_post = X_raw
 
-        # 3) Reconstruct aggregated update (still padded)
-        recovered_flat = (X_post.float() @ self.Q_codebook).reshape(-1)
+        # 3) Apply aggregation method before reconstruction
+        X_agg = aggregate_sparse_vectors(X_post, method=self.agg_method, trim_frac=self.trim_frac)
 
-        # 4) Metrics (vs integer targets)
+        # 4) Reconstruct aggregated update (still padded)
+        recovered_flat = (X_agg.float() @ self.Q_codebook).reshape(-1)
+
+        # 5) Metrics (vs integer targets)
         Xp_np = X_post.detach().cpu().numpy()
         T_np  = target_vectors.detach().cpu().numpy()
         acc_vec  = compute_accuracy_batch(T_np, Xp_np)
@@ -200,10 +280,10 @@ class WirelessCompressor(nn.Module):
 
         return recovered_flat, K_est_final, K_int_final, ampnet_loss, ampnet_acc, ampnet_pupe, sigma2_final, snr_final_db
 
-    def forward(self, deltas_w_feedback, args):
+    def forward(self, deltas_w_feedback, args, rnd_seed: int = 0):
         """
         Round pipeline:
-          (a) build Q via k-means++ on base-station mini dataset,
+          (a) build Q via k-means++ on base-station mini dataset (with curvature mode),
           (b) compute idx_mini + π̂, then reorder {Q, idx_mini, π̂} by args.code_order (NOT URA),
           (c) quantize all device splits with Q,
           (d) build targets + π_target, apply same permutation,
@@ -217,12 +297,13 @@ class WirelessCompressor(nn.Module):
         pad = (-bs_mini.numel()) % L
         if pad > 0:
             bs_mini = torch.cat([bs_mini, bs_mini.new_zeros(pad)])
-        bs_blocks = bs_mini.view(-1, L).cpu().numpy()
-        centers, _ = kmeans_plusplus(bs_blocks, n_clusters=args.n, random_state=0)
-        new_Q = torch.tensor(centers, device=self.device, dtype=self.Q_codebook.dtype)
+        bs_blocks = bs_mini.view(-1, L)
+
+        # Use curvature-aware codebook creation
+        new_Q = create_quantisation_codebook(bs_blocks, args)
 
         # 2) Estimate pi distribution & apply codebook ordering
-        mini = torch.from_numpy(bs_blocks).to(self.device)
+        mini = bs_blocks.to(self.device)
         dists_mini = torch.cdist(mini, new_Q, p=2)
         idx_mini = torch.argmin(dists_mini, dim=1)                  # (S,)
         pi_est = torch.bincount(idx_mini, minlength=args.n).float()
@@ -258,7 +339,7 @@ class WirelessCompressor(nn.Module):
                 y, S, target_vectors,
                 pi_est=pi_est,
                 idx_mini=idx_mini,
-                K_a=K_a, k_agg="mean", trim=0.0, z_clean=z_clean
+                K_a=K_a, z_clean=z_clean
             )
         
         # 7) Remove padding & reshape quantisation error updates
@@ -294,6 +375,13 @@ def federated_training(
     bpd = compute_bits_per_dimension(args.n, args.message_split)
     print(f"Bits per dimension: {bpd:.3f} bits/dim")
 
+    # Error feedback toggle
+    use_error_feedback = bool(getattr(args, 'use_error_feedback', True))
+    corruption_frac = float(getattr(args, 'corruption_frac', 0.0))
+    agg_method = str(getattr(args, 'agg_method', 'average')).lower()
+    print(f"Error feedback: {'enabled' if use_error_feedback else 'disabled'}")
+    print(f"Corruption fraction: {corruption_frac:.2%}")
+    print(f"Aggregation method: {agg_method}")
 
     # 1) Global optimizer & history init
     momentum_buffer_list = [torch.zeros_like(p.data, device=device) for p in global_model.parameters()]
@@ -306,6 +394,8 @@ def federated_training(
         'test_acc': [], 'K_a': [], 'K_est': [], 'sigma2_final': [], 'snr_final': [], 'mean_local_loss': [],
     }
     best_test_acc = -1.0; rounds_no_improve = 0
+    best_global_model_state = copy.deepcopy(global_model.state_dict())
+    best_rnd = 0
 
     # 3) Load pretrained WirelessCompressor
     compressor = WirelessCompressor(args, device).to(device)
@@ -378,15 +468,23 @@ def federated_training(
             local_deltas.append(local_flat - global_flat)
         deltas = torch.stack(local_deltas, dim=0)  # Shape: (K_a, D)
 
-        # 4f) Add quantisation error feedback
-        error_list = [Q_errors[dev_id].detach() for dev_id in participants]
-        error_matrix = torch.stack(error_list, dim=0)  # (K_a, D)
-        deltas_w_feedback = deltas + error_matrix
-        error_feedback_info(deltas, error_matrix)
+        # 4e.5) Apply corruption if enabled
+        if corruption_frac > 0.0:
+            deltas = corrupt_deltas(deltas, corruption_frac, seed=args.seed + rnd)
+            print(f"[corruption] Applied {corruption_frac:.0%} corruption to {int(K_a * corruption_frac)} devices")
+
+        # 4f) Add quantisation error feedback (if enabled)
+        if use_error_feedback:
+            error_list = [Q_errors[dev_id].detach() for dev_id in participants]
+            error_matrix = torch.stack(error_list, dim=0)  # (K_a, D)
+            deltas_w_feedback = deltas + error_matrix
+            error_feedback_info(deltas, error_matrix)
+        else:
+            deltas_w_feedback = deltas
 
         # 4g) Compress via wireless channel
         compressor.eval() 
-        recovered_update, new_errors, amp_loss, K_est, K_int, amp_acc, amp_pupe, sigma2_est, snr_final_db = compressor(deltas_w_feedback, args=args)
+        recovered_update, new_errors, amp_loss, K_est, K_int, amp_acc, amp_pupe, sigma2_est, snr_final_db = compressor(deltas_w_feedback, args=args, rnd_seed=rnd)
         print(f"Compression done, K_true={K_a}, K_est={K_est:.3f} (K_int={K_int}), AMP-DA-Net Loss={amp_loss:.4f}, SNR≈{snr_final_db:.2f} dB")
 
         history['ampnet_loss'].append(amp_loss)
@@ -396,9 +494,10 @@ def federated_training(
         history['sigma2_final'].append(sigma2_est)
         history['snr_final'].append(snr_final_db)
 
-        # 4h) Update quantisation errors per device
-        for i, dev_id in enumerate(participants): 
-            Q_errors[dev_id] = new_errors[i].detach()
+        # 4h) Update quantisation errors per device (if error feedback enabled)
+        if use_error_feedback:
+            for i, dev_id in enumerate(participants): 
+                Q_errors[dev_id] = new_errors[i].detach()
 
         # 4i) Build averaged delta list
         avg_delta = []
@@ -465,74 +564,90 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wireless Federated Learning with AMP-DA-Net Compression")
 
     # === Dataset Parameters ===
-    parser.add_argument('--data-dir',         type=str, default="runs/datasets", help="path to CIFAR-10 dataset")
+    parser.add_argument('--data-dir', type=str, default="runs/datasets", help="path to CIFAR-10 dataset")
     parser.add_argument('--batch-size-train', type=int, default=16, help="batch size for training")
-    parser.add_argument('--batch-size-test',  type=int, default=16, help="batch size for testing")
-    parser.add_argument('--frac-random',      type=float, default=0.2, help="fraction of random samples per device")
+    parser.add_argument('--batch-size-test', type=int, default=16, help="batch size for testing")
+    parser.add_argument('--frac-random', type=float, default=0.2, help="fraction of random samples per device")
     
     # === Federated Learning Parameters ===
-    parser.add_argument('--K-t',              type=int, default=40, help="total number of devices") # Make sure is a factor of 50,000
-    parser.add_argument('--min-p',            type=int, default=2, help="minimum participants per round")
-    parser.add_argument('--max-p',            type=int, default=2, help="maximum participants per round")
-    parser.add_argument('--total-rounds',     type=int, default=5, help="total number of global rounds")
-    parser.add_argument('--local-epochs',     type=int, default=3, help="number of local epochs per round")
+    parser.add_argument('--K-t', type=int, default=40, help="total number of devices")
+    parser.add_argument('--min-p', type=int, default=2, help="minimum participants per round")
+    parser.add_argument('--max-p', type=int, default=2, help="maximum participants per round")
+    parser.add_argument('--total-rounds', type=int, default=5, help="total number of global rounds")
+    parser.add_argument('--local-epochs', type=int, default=3, help="number of local epochs per round")
     parser.add_argument('--local-batch-size', type=int, default=20, help="local training batch size")
-    parser.add_argument('--local-lr',         type=float, default=0.01, help="local learning rate")
+    parser.add_argument('--local-lr', type=float, default=0.01, help="local learning rate")
     
     # === Global Optimizer Parameters ===
-    parser.add_argument('--optimizer',        type=str, default='fedavg', choices=['fedavg', 'fedavgm', 'fedadam'], help="global optimizer type")
-    parser.add_argument('--global-lr',        type=float, default=1.0, help="global learning rate")
-    parser.add_argument('--momentum',         type=float, default=0.0, help='SGD momentum')
-    parser.add_argument('--beta1',            type=float, default=0.9, help='Adam beta1')
-    parser.add_argument('--beta2',            type=float, default=0.99, help='Adam beta2')
-    parser.add_argument('--eps',              type=float, default=0, help='Adam epsilon')
+    parser.add_argument('--optimizer', type=str, default='fedavg', choices=['fedavg', 'fedavgm', 'fedadam'], help="global optimizer type")
+    parser.add_argument('--global-lr', type=float, default=1.0, help="global learning rate")
+    parser.add_argument('--momentum', type=float, default=0.0, help='SGD momentum')
+    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.99, help='Adam beta2')
+    parser.add_argument('--eps', type=float, default=0, help='Adam epsilon')
     
     # === Wireless Channel & Compression Parameters ===
-    parser.add_argument('--message-split',    type=int, default=10, help="message split size & quantization dimension")
-    parser.add_argument('--n',                type=int, default=256, help="number of codewords in codebooks")
-    parser.add_argument('--dim',              type=int, default=64, help="encoding dimension")
-    parser.add_argument('--snr-db',           type=float, default=20.0, help="runtime channel SNR used in FL")
-    parser.add_argument('--snr-mode',         type=str, default='range', choices=['fixed','range'], help="used only for decoder loading. runtime channel still uses --snr-db")
-    parser.add_argument('--snr-min-db',       type=float, default=0.0,  help="for slug when --snr-mode=range")
-    parser.add_argument('--snr-max-db',       type=float, default=20.0, help="for slug when --snr-mode=range")
+    parser.add_argument('--message-split', type=int, default=10, help="message split size & quantization dimension")
+    parser.add_argument('--n', type=int, default=256, help="number of codewords in codebooks")
+    parser.add_argument('--dim', type=int, default=64, help="encoding dimension")
+    parser.add_argument('--snr-db', type=float, default=20.0, help="runtime channel SNR used in FL")
+    parser.add_argument('--snr-mode', type=str, default='range', choices=['fixed', 'range'], help="used only for decoder loading")
+    parser.add_argument('--snr-min-db', type=float, default=0.0, help="for slug when --snr-mode=range")
+    parser.add_argument('--snr-max-db', type=float, default=20.0, help="for slug when --snr-mode=range")
 
-    parser.add_argument("--post-rounding",    action=argparse.BooleanOptionalAction, default=True, help="apply post-rounding (use --no-post-rounding to disable)")
+    parser.add_argument("--post-rounding", action=argparse.BooleanOptionalAction, default=True, help="apply post-rounding")
     parser.add_argument('--grad-accumulation-size', type=int, default=128, help="gradient accumulation size for decoding")
-    parser.add_argument('--code-order',       type=str, default="pop", choices=["none", "pop", "spectral", "spectral_pop"])
+    parser.add_argument('--code-order', type=str, default="pop", choices=["none", "pop", "spectral", "spectral_pop"])
+
+    # === Aggregation & Robustness Parameters ===
+    parser.add_argument('--agg-method', type=str, default='average', choices=['average', 'majority_voting', 'trimmed_mean'], help="Aggregation method for sparse vectors")
+    parser.add_argument('--trim-frac', type=float, default=0.1, help="Fraction to trim on each side for trimmed_mean")
+    parser.add_argument('--corruption-frac', type=float, default=0.0, help="Fraction of devices to corrupt (Byzantine simulation)")
+    parser.add_argument('--use-error-feedback', action=argparse.BooleanOptionalAction, default=True, help="Enable error feedback accumulation")
+
+    # === Curvature-Aware Codebook Creation ===
+    parser.add_argument('--kmeans-max-iter', type=int, default=0, help="Max Lloyd iterations for K-means (0 = just k-means++ seeds)")
+    parser.add_argument('--curv-mode', type=str, default='none', choices=['none', 'diagonal_hessian_proxy', 'data_whitening'], help="Curvature-aware codebook creation mode")
+    parser.add_argument('--curv-max-samples', type=int, default=10000, help="Max samples for curvature estimation")
+    parser.add_argument('--curv-eps', type=float, default=1e-6, help="Regularization epsilon for curvature methods")
 
     # === AMPNet Parameters ===
-    parser.add_argument('--num-layers',       type=int, default=10, help="number of AMPNet layers")
-    parser.add_argument('--num-filters',      type=int, default=32, help="number of filters in AMPNet")
-    parser.add_argument('--kernel-size',      type=int, default=3, help="kernel size in AMPNet")
-    parser.add_argument('--use-poisson',      action=argparse.BooleanOptionalAction, default=True, help="Use spike+Poisson counts prior (use --no-use-poisson for uniform counts)")
-    parser.add_argument('--update-alpha',     action=argparse.BooleanOptionalAction, default=True, help="Enable per-layer alpha prior-posterior mixing")
-    parser.add_argument('--learn-sigma2',     action=argparse.BooleanOptionalAction, default=True, help="Enable σ² EM head for noise-variance updates.")
-    parser.add_argument('--finetune-K',       action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of K per layer.")
-    parser.add_argument('--finetune-pi',      action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of π per layer.")
-    parser.add_argument('--finetune-sigma2',  action=argparse.BooleanOptionalAction, default=True, help="Blend σ² via learned step size (requires --learn-sigma2).")
+    parser.add_argument('--num-layers', type=int, default=10, help="number of AMPNet layers")
+    parser.add_argument('--num-filters', type=int, default=32, help="number of filters in AMPNet")
+    parser.add_argument('--kernel-size', type=int, default=3, help="kernel size in AMPNet")
+    parser.add_argument('--use-poisson', action=argparse.BooleanOptionalAction, default=True, help="Use spike+Poisson counts prior")
+    parser.add_argument('--update-alpha', action=argparse.BooleanOptionalAction, default=True, help="Enable per-layer alpha prior-posterior mixing")
+    parser.add_argument('--learn-sigma2', action=argparse.BooleanOptionalAction, default=True, help="Enable σ² EM head for noise-variance updates.")
+    parser.add_argument('--finetune-K', action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of K per layer.")
+    parser.add_argument('--finetune-pi', action=argparse.BooleanOptionalAction, default=True, help="Enable learned refinement of π per layer.")
+    parser.add_argument('--finetune-sigma2', action=argparse.BooleanOptionalAction, default=True, help="Blend σ² via learned step size.")
     parser.add_argument('--per-sample-sigma', action=argparse.BooleanOptionalAction, default=True, help="Track per-sample σ² (B,1) instead of a scalar.")
     parser.add_argument('--per-sample-alpha', action=argparse.BooleanOptionalAction, default=False, help="Use per-sample alpha instead of batch-averaged alpha.")
-    parser.add_argument('--K-max',            type=int, default=-1, help="Fixed discrete prior cap K_max (≤ n) -1 represents adaptive (2*Ka)")
-    parser.add_argument('--blend-init',       type=float, default=0.85, help="Initial CNN blend weight in (0,1) for m1-CNN")
+    parser.add_argument('--K-max', type=int, default=-1, help="Fixed discrete prior cap K_max (≤ n) -1 represents adaptive (2*Ka)")
+    parser.add_argument('--blend-init', type=float, default=0.85, help="Initial CNN blend weight in (0,1) for m1-CNN")
     
     # === Compressor Loading ===
-    parser.add_argument('--ckpt-dir',         type=str, default="runs/checkpoints/pretrain")
-    parser.add_argument('--decoder-slug',     type=str, default="", help="override auto slug")
-    parser.add_argument('--decoder-path',     type=str, default="", help="explicit path to <slug>.pth")
-    parser.add_argument('--codebook-path',    type=str, default="", help="explicit path to <slug>_cb.pt")
-    parser.add_argument('--codebook-init',    type=str, default='gaussian', choices=['q_init', 'gaussian', 'bernoulli'], help="codebook initializer used during pretraining (for artifact selection)")
-    parser.add_argument('--codebook-trainable', action=argparse.BooleanOptionalAction, default=True, help="whether URA codebook was trainable during pretraining (for artifact selection)")
-    parser.add_argument('--within-round',     type=str, default="random", choices=["prefix", "contig_rand", "random"], help="Sampling strategy within each round")
+    parser.add_argument('--ckpt-dir', type=str, default="runs/checkpoints/pretrain")
+    parser.add_argument('--decoder-slug', type=str, default="", help="override auto slug")
+    parser.add_argument('--decoder-path', type=str, default="", help="explicit path to <slug>.pth")
+    parser.add_argument('--codebook-path', type=str, default="", help="explicit path to <slug>_cb.pt")
+    parser.add_argument('--codebook-init', type=str, default='gaussian', choices=['q_init', 'gaussian', 'bernoulli'], help="codebook initializer used during pretraining")
+    parser.add_argument('--codebook-trainable', action=argparse.BooleanOptionalAction, default=True, help="whether URA codebook was trainable during pretraining")
+    parser.add_argument('--within-round', type=str, default="random", choices=["prefix", "contig_rand", "random"], help="Sampling strategy within each round")
+
+    # === Pretraining parameters for slug matching ===
+    parser.add_argument('--quant-type', type=str, default='kmeans_plusplus', choices=['kmeans_plusplus'], help='Quantizer type (for slug matching)')
+    parser.add_argument('--lambda-q', type=float, default=0.0, help='Quantization penalty (for slug matching)')
 
     # === Global Model Selection ===
-    parser.add_argument('--model',            type=str, default='resnet', choices=['resnet', 'cifarcnn', 'custom'])
-    parser.add_argument('--custom-model',     type=str, default='', help="module.path:ClassName")
-    parser.add_argument('--custom-kwargs',    type=str, default='{}')
+    parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'smallvgg', 'custom'])
+    parser.add_argument('--custom-model', type=str, default='', help="module.path:ClassName")
+    parser.add_argument('--custom-kwargs', type=str, default='{}')
 
     # === System Parameters ===
     parser.add_argument('--early-stopping-patience', type=int, default=20)
-    parser.add_argument('--save-dir',         type=str, default="runs/results")
-    parser.add_argument('--seed',             type=int, default=42)
+    parser.add_argument('--save-dir', type=str, default="runs/results")
+    parser.add_argument('--seed', type=int, default=42)
 
     args = parser.parse_args()
 
@@ -586,6 +701,11 @@ if __name__ == "__main__":
         final_K_est=float(history["K_est"][-1]) if history["K_est"] else None,
         final_sigma2=float(history["sigma2_final"][-1]) if history["sigma2_final"] else None,
         final_snr_db=float(history["snr_final"][-1]) if history["snr_final"] else None,
+        agg_method=str(getattr(args, 'agg_method', 'average')),
+        corruption_frac=float(getattr(args, 'corruption_frac', 0.0)),
+        use_error_feedback=bool(getattr(args, 'use_error_feedback', True)),
+        curv_mode=str(getattr(args, 'curv_mode', 'none')),
+        kmeans_max_iter=int(getattr(args, 'kmeans_max_iter', 0)),
     )
     save_json(final_summary, os.path.join(summ_dir, "final_summary.json"))
     append_jsonl({**run_manifest(args), **final_summary}, os.path.join(summ_dir, "runs.jsonl"))

@@ -7,7 +7,8 @@ python -u -m scripts.1_dataset_collection \
   --train-size             40000 \
   --valid-size             10000 \
   --test-size              2000 \
-  --early-stopping-patience 1000 \
+  --num-test-rounds        5 \
+  --within-round           random \
   \
   --model                 resnet \
   --K-t                   40 \
@@ -16,9 +17,6 @@ python -u -m scripts.1_dataset_collection \
   --frac-random           0.2 \
   \
   --message-split         20 \
-  --n                     128 \
-  --dim                   64 \
-  --code-order            pop \
   \
   --total-rounds          1000 \
   --local-epochs          3 \

@@ -6,19 +6,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from numpy.linalg import svd, norm, eigvals
 
-def visualise_codebook_heatmap(C, title="Codebook Heatmap", save_path=None):
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(C, cmap="viridis", cbar=True)
-    plt.title(title)
-    plt.xlabel("Codebook Columns")
-    plt.ylabel("Codebook Rows")
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.show()
-
-
 def analyse_codebook(C, plot=True, k_rip=None, save_path=None, show_plots=True):
     """
     Analyse a codebook matrix for wireless transmission with easy-to-understand metrics.

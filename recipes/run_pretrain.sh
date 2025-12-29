@@ -1,10 +1,6 @@
 # run_pretrain.sh
 
 python -u -m scripts.2_pretraining \
-  --train-size            256000 \
-  --valid-size            32000 \
-  --test-size             20000 \
-  --num-test-rounds       5 \
   --pt-epochs             500 \
   --pt-batch-size         64 \
   --pt-patience           50 \
@@ -15,7 +11,6 @@ python -u -m scripts.2_pretraining \
   --dataset-dir           "runs/datasets/iFed_datasets" \
   --code-order            pop \
   --model                 resnet \
-  --frac-random           0.2 \
   --within-round          random \
   \
   --K-t                   40 \
@@ -47,11 +42,18 @@ python -u -m scripts.2_pretraining \
   --codebook-trainable \
   --codebook-init         gaussian \
   \
+  --quant-type            kmeans_plusplus \
+  --kmeans-max-iter       0 \
+  --curv-mode             none \
+  --curv-max-samples      10000 \
+  --curv-eps              1e-6 \
+  \
   --amp-lr                0.0001 \
   --lambda-sparse         0.001 \
   --lambda-w              0.001 \
   --lambda-k              0.01 \
+  --lambda-q              0.0 \
   \
   --seed                  42 \
-  --ckpt-dir              "runs/checkpoints" \
-  --save-dir              "runs/results"
+  --ckpt-dir              "runs/checkpoints/pretrain" \
+  --save-dir              "runs/results/pretrain"
