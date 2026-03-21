@@ -156,7 +156,6 @@ class WirelessCompressor(nn.Module):
         ).to(device)
         self.ampnet.load_state_dict(amp_state, strict=True)
         self.ampnet.eval()
-        self.ampnet.set_init_const(100.0)
 
         # 3) Working quantizer codebook for this round (n x L), refreshed each round & criterion function
         self.register_buffer("Q_codebook", torch.zeros(args.n, args.message_split, device=device))

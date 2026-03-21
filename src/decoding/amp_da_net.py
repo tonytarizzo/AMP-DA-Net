@@ -50,7 +50,7 @@ class AMPNet1DEnhanced(nn.Module):
         self.pi_step_raw    = nn.Parameter(torch.zeros(self.T))
         self.sigma_step_raw = nn.Parameter(torch.zeros(self.T))
 
-        # Small 1D CNN denoisers; channels: [R, sqrt(Vi), m1, sqrt(var), alpha, lambda]
+        # Small 1D CNN denoisers; channels: [R, sqrt(Vi), m1, sqrt(var), alpha, normalised log-λ]
         pad = kernel_size // 2
         Cin = 6
         self.denoisers = nn.ModuleList()
@@ -78,18 +78,10 @@ class AMPNet1DEnhanced(nn.Module):
             "sigma2":  None,     # scalar per round
         }
         self._current_codebook_id = None
-        self.init_policy   = "const_sigma2"   # or "snr_db"
-        self.sigma2_const  = 100.0            # used when init_policy == "const_sigma2"
-        self.snr_init_db   = -100.0           # used when init_policy == "snr_db"
+        self.sigma2_const = 10.0
 
     def set_init_const(self, sigma2: float):
-        self.init_policy  = "const_sigma2"
         self.sigma2_const = float(sigma2)
-        return self
-
-    def set_init_from_snr_db(self, snr_db: float):
-        self.init_policy = "snr_db"
-        self.snr_init_db = float(snr_db)
         return self
 
     @staticmethod
@@ -132,19 +124,7 @@ class AMPNet1DEnhanced(nn.Module):
         Ka0 = 10.0
         self._round_params["K_float"] = Ka0
         self._round_params["K_int"] = int(round(Ka0))
-        if self.init_policy == "const_sigma2":
-            sigma2 = float(self.sigma2_const)
-        elif self.init_policy == "snr_db":
-            snr_lin = 10.0 ** (self.snr_init_db / 10.0)
-            if self.per_sample_sigma:
-                Py = z_round.pow(2).mean(dim=1, keepdim=True)     # (B,1)
-                sigma2 = (Py / (1.0 + snr_lin)).clamp_min(self._eps())
-            else:
-                Py = z_round.pow(2).mean()
-                sigma2 = max(self._eps(), float(Py.item() / (1.0 + snr_lin)))
-        else:
-            raise ValueError(f"Unknown init_policy: {self.init_policy}")
-        self._round_params["sigma2"] = sigma2
+        self._round_params["sigma2"] = float(self.sigma2_const)
 
     # ---------- discrete Bayes table ----------
     def _discrete_mmse_counts(self, R, Vi, alpha, lam, K_max, tau):
@@ -191,8 +171,9 @@ class AMPNet1DEnhanced(nn.Module):
     def forward(self, y, external_URA_codebook=None, pi_round=None, snr_db=None):
         """
         y: (B,d)
-        If K_round / snr_db are None, use start_new_round() cached values.
         pi_round: (n,) required (the denoiser needs π to form λ=Kπ).
+        snr_db: ignored — sigma2 is always taken from the start_new_round() cache.
+        start_new_round() must be called before each forward pass.
         """
         device = y.device
         C_nt = external_URA_codebook.to(device) if external_URA_codebook is not None else self.C_nt
@@ -212,13 +193,12 @@ class AMPNet1DEnhanced(nn.Module):
         K_trace = [Ka.detach().item()]  # logging only
         K_max = (int(self.fixed_Kmax) if self.fixed_Kmax is not None else int(max(8, int((2 * Ka).item()))))
 
-        # λ, α0
+        # λ, α
         lam = (Ka * pi).clamp_min(self._eps())
         if self.per_sample_alpha:
-            alpha0 = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6).unsqueeze(0).expand(B, -1)  # (B,n)
+            alpha = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6).unsqueeze(0).expand(B, -1).clone()  # (B,n)
         else:
-            alpha0 = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6)  # (n,)
-        alpha  = alpha0.clone()
+            alpha = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6).clone()  # (n,)
 
         # Messages/state
         x_hat   = torch.zeros(B, self.n, device=device, dtype=y.dtype)
@@ -226,18 +206,9 @@ class AMPNet1DEnhanced(nn.Module):
         Z       = y.clone()
         V       = torch.ones(B, d, device=device, dtype=y.dtype)
 
-        # Noise variance init (prefer per-round cache)
-        if snr_db is None and self._round_params["sigma2"] is not None:
-            sigma2 = float(self._round_params["sigma2"])  # scalar
-        else:
-            snr_lin = 10.0 ** (float(snr_db) / 10.0)
-            if self.per_sample_sigma:
-                Py = y.pow(2).mean(dim=1, keepdim=True)               # (B,1)
-                sigma2 = (Py / (1.0 + snr_lin)).clamp_min(1e-12)      # (B,1)
-            else:
-                Py = y.pow(2).mean()
-                sigma2 = max(1e-12, float(Py.item() / (1.0 + snr_lin)))
-        sigma_trace = [float(torch.as_tensor(sigma2).mean().item())] if torch.is_tensor(sigma2) else [float(sigma2)]
+        assert self._round_params["sigma2"] is not None, "Must call start_new_round() before forward()"
+        sigma2 = float(self._round_params["sigma2"])
+        sigma_trace = [float(sigma2)]
 
         # ---------- unrolled layers ----------
         for t in range(self.T):
@@ -274,46 +245,58 @@ class AMPNet1DEnhanced(nn.Module):
             if self.update_alpha:
                 mix_alpha_t = torch.sigmoid(self.alpha_mix_raw[t])       # (0,1)
                 if self.per_sample_alpha:
-                    alpha = (1 - mix_alpha_t) * alpha0 + mix_alpha_t * alpha_post  # per-sample α: use the per-sample posterior α_post (B,n)
+                    alpha = (1 - mix_alpha_t) * alpha + mix_alpha_t * alpha_post  # per-sample α
                 else:
                     alpha_batch = alpha_post.mean(dim=0)                 # (n,)
-                    alpha = (1 - mix_alpha_t) * alpha0 + mix_alpha_t * alpha_batch  # global α: average over batch to get (n,)
+                    alpha = (1 - mix_alpha_t) * alpha + mix_alpha_t * alpha_batch  # global α
             
             # CNN refine & blend
             sqrt_Vi  = torch.sqrt(Vi.clamp_min(1e-12))
             sqrt_var = torch.sqrt(v_tab.clamp_min(1e-12))
-            alphaB   = alpha if alpha.dim() == 2 else alpha.unsqueeze(0).expand(B, -1)
-            lamB     = lam.unsqueeze(0).expand(B, -1)
+            alphaB       = alpha if alpha.dim() == 2 else alpha.unsqueeze(0).expand(B, -1)
+            log_lam      = torch.log(lam.clamp_min(self._eps()))          # (n,)
+            mu_log       = log_lam.mean()
+            std_log      = log_lam.std(unbiased=False) + 1e-6
+            log_lam_norm = (log_lam - mu_log) / std_log                   # (n,) normalised log-λ
+            log_lamB     = log_lam_norm.unsqueeze(0).expand(B, -1)        # (B,n)
 
-            den_in = torch.stack([R, sqrt_Vi, m1, sqrt_var, alphaB, lamB], dim=1)  # (B,6,n)
+            den_in = torch.stack([R, sqrt_Vi, m1, sqrt_var, alphaB, log_lamB], dim=1)  # (B,6,n)
             x_cnn  = self.denoisers[t](den_in).squeeze(1)                          # (B,n), ≥0
             x_hat  = (1.0 - mix_t) * m1 + mix_t * x_cnn
             var_hat = v_tab  # keep Bayesian variance for the V recursion
 
-            # ---------- Optional parameter fine-tuning (data-driven, no hand damping) ----------
-            # K and π from the current posterior means
-            if self.finetune_K or self.finetune_pi:
-                K_post  = m1.sum(dim=1).mean()                   # scalar
-                pi_post = m1.sum(dim=0)
-                pi_post = pi_post / (pi_post.sum().clamp_min(1e-12))
+            # --- EM updates for K, π ---
+            m1_bar  = m1.mean(dim=0)                               # (n,)
+            v_bar   = v_tab.mean(dim=0)                            # (n,)
+            lam_hat = m1_bar.clamp_min(self._eps())                # proposed EM λ
 
-            # K update (learned step in (0,2))
+            # Confidence-gated step size ρ ∈ (0,1)
+            conf_i = (m1_bar**2) / (v_bar + 1e-12)
+            rho_t  = (conf_i.mean() / (conf_i.mean() + 1.0)).clamp(1e-3, 1-1e-3)
+
+            # Geometric interpolation in log-λ space
+            log_lam_cur = torch.log(lam.clamp_min(self._eps()))
+            log_lam_hat = torch.log(lam_hat)
+            lam = torch.exp(log_lam_cur + rho_t * (log_lam_hat - log_lam_cur))
+
+            Ka_new = lam.sum().clamp_min(0.0)
+            pi_new = self._normalize_pi(lam / Ka_new.clamp_min(self._eps()))
             if self.finetune_K:
-                sK = 1.0 if t == 0 else (2.0 * torch.sigmoid(self.k_step_raw[t]))
-                Ka = torch.clamp(Ka + sK * (K_post - Ka), 0.0, float(self.n))  # keep Ka as tensor
-
-            # π update (learned step in (0,1))
+                Ka = Ka_new
             if self.finetune_pi:
-                sPi = torch.sigmoid(self.pi_step_raw[t])
-                pi  = (1.0 - sPi) * pi + sPi * pi_post
-                pi  = self._normalize_pi(pi)
-
-            # update logs & K output
+                pi = pi_new
             K_trace.append(Ka.detach().item())
 
-            # refresh λ, α0 after K/π moves
-            lam = (Ka * pi).clamp_min(self._eps())
-            alpha0 = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6)
+            # Tie α to updated λ
+            alpha_from_lam = (1.0 - torch.exp(-lam)).clamp(1e-6, 1-1e-6)
+            if self.update_alpha:
+                eta = torch.sigmoid(self.alpha_mix_raw[t])
+                if self.per_sample_alpha:
+                    alpha = (1 - eta) * alpha + eta * alpha_from_lam.unsqueeze(0).expand_as(alpha)
+                else:
+                    alpha = (1 - eta) * alpha + eta * alpha_from_lam
+            else:
+                alpha = alpha_from_lam
 
             # σ² EM head (overwrite or log-gated blend; per-sample if enabled)
             if self.learn_sigma2:

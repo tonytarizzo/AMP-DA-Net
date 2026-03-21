@@ -237,10 +237,9 @@ class PretrainDecoder(nn.Module):
             z = add_awgn_noise(z, snr_db)
         return z
     
-    def forward(self, x, snr_db=None, pi=None, use_cached_sigma=False):
+    def forward(self, x, snr_db=None, pi=None):
         z = self.encode_with_noise(x, snr_db)
-        snr_for_amp = None if use_cached_sigma else snr_db
-        x_est, k_final, K_trace, sigma_trace = self.ampnet(z, external_URA_codebook=self.C_syn, pi_round=pi, snr_db=snr_for_amp)
+        x_est, k_final, K_trace, sigma_trace = self.ampnet(z, external_URA_codebook=self.C_syn, pi_round=pi)
         return z, x_est, k_final, K_trace, sigma_trace
 
 
@@ -363,7 +362,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                 
                 opt_amp.zero_grad(set_to_none=True)
                 snr_db = snr_next_train()
-                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round)
                 loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                 loss.backward()
                 opt_amp.step()
@@ -396,7 +395,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                 
                 opt_amp.zero_grad(set_to_none=True)
                 snr_db = snr_next_train()
-                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round)
                 loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                 loss.backward()
                 opt_amp.step()
@@ -413,7 +412,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
             
             opt_amp.zero_grad(set_to_none=True)
             snr_db = snr_next_train()
-            _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round, use_cached_sigma=True)
+            _, x_hat, k_final, _, _ = model(batch_x, snr_db=snr_db, pi=current_pi_round)
             loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
             loss.backward()
             opt_amp.step()
@@ -451,7 +450,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                     batch_q_err = torch.stack(val_q_err_batch)
                     batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
                     
-                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round)
                     val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                     val_losses_round.append(float(val_loss.detach().item()))
                     
@@ -478,7 +477,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                     batch_q_err = torch.stack(val_q_err_batch)
                     batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
                     
-                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                    _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round)
                     val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                     val_losses_round.append(float(val_loss.detach().item()))
                     
@@ -490,7 +489,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
                 batch_q_err = torch.stack(val_q_err_batch)
                 batch_K = torch.tensor(val_K_batch, device=args.device, dtype=torch.float32)
                 
-                _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round, use_cached_sigma=True)
+                _, x_hat, k_final, _, _ = model(batch_x, snr_db=val_current_snr_db, pi=val_current_pi_round)
                 val_loss = criterion(model, batch_x, x_hat, batch_K, k_final, batch_q_err)
                 val_losses_round.append(float(val_loss.detach().item()))
 

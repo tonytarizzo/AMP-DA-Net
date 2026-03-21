@@ -14,6 +14,7 @@ __pycache__/
 runs/
 logs/
 results/
+recipes/test_*.sh
 *.pth
 *.pt
 *.npz
