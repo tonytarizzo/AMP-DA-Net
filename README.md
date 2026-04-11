@@ -62,6 +62,5 @@ Or for the earlier conference version:
       archivePrefix={arXiv},
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2509.16577},
-      note={Submitted to IEEE International Conference on Acoustics, Speech, and Signal Processing 2026}
 }
 ```
