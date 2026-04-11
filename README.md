@@ -62,5 +62,6 @@ Or for the earlier conference version:
       archivePrefix={arXiv},
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2509.16577},
+      note={Initial version first submitted to ICASSP 2026; revised conference version submitted to SPAWC 2026}
 }
 ```
