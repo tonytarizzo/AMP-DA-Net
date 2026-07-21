@@ -1,6 +1,8 @@
-# run_inference.sh
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_common.sh"
 
-python -u -m scripts.3_feel_inference \
+"$PYTHON_BIN" -u -m scripts.3_feel_inference \
   --data-dir              "runs/datasets" \
   --batch-size-train      16 \
   --batch-size-test       16 \
@@ -30,6 +32,7 @@ python -u -m scripts.3_feel_inference \
   --snr-min-db            0.0 \
   --snr-max-db            20.0 \
   --post-rounding \
+  --post-processing       paper \
   --code-order            pop \
   \
   --agg-method            average \

@@ -1,6 +1,8 @@
-# run_collection.sh
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_common.sh"
 
-python -u -m scripts.1_dataset_collection \
+"$PYTHON_BIN" -u -m scripts.1_dataset_collection \
   --data-dir              "runs/datasets" \
   --save-dir              "runs/results" \
   \

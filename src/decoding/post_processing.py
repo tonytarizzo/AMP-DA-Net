@@ -12,6 +12,9 @@ def greedy_rounding(x, K_a):
     x_int : ndarray, shape (n,)
         Integer-rounded version of x with sum(x_int) = K_a.
     """
+    K_a = int(K_a)
+    if K_a < 0:
+        raise ValueError("K_a must be non-negative")
     x_clipped = np.clip(x, 0, None)
 
     x_floor = np.floor(x_clipped)
@@ -34,17 +37,27 @@ def greedy_rounding(x, K_a):
             diff -= 1
     else:
         surplus = -diff
-        frac = x_clipped - x_floor
-        idx_asc = np.argsort(frac)
-
-        for i in idx_asc:
-            if surplus <= 0:
-                break
-            if x_int[i] > 0:
-                x_int[i] -= 1
-                surplus -= 1
+        # A coordinate may need to be decremented more than once. Choose the
+        # smallest increase in squared error at each step.
+        while surplus > 0:
+            eligible = x_int > 0
+            if not np.any(eligible):
+                raise RuntimeError("Unable to satisfy the requested count sum")
+            marginal_cost = np.where(
+                eligible,
+                1.0 - 2.0 * (x_int - x_clipped),
+                np.inf,
+            )
+            idx = int(np.argmin(marginal_cost))
+            x_int[idx] -= 1
+            surplus -= 1
     
     return x_int.astype(int)
+
+
+def paper_count_projection(x, K_a):
+    """SPAWC projection: non-negative clipping followed by sum-K rounding."""
+    return greedy_rounding(np.clip(x, 0, None), K_a)
 
 def top_k_nonneg(x, K):
     """

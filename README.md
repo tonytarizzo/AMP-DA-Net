@@ -1,6 +1,6 @@
 # AMP-DA-Net
 
-Supporting code for **“Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning” (2025)**.  
+Supporting code for **“Learned Digital Over-the-Air Computing for Federated Edge Learning.”**
 This repo contains three end-to-end stages:
 
 1) **Dataset collection** (simulate FL + wireless compression, save iFed bundles)  
@@ -34,9 +34,29 @@ python -m scripts.3_feel_inference
 
 The paths for collected datasets and pretrained encoder-decoder pairs are automatically named. This ensures that the next script can locate them automatically, while ensuring the same setup is used for all 3 scripts. If you change one recipe, change the other two to match.
 
+## Conference experiments
+
+The scripts in `recipes/paper/` contain the settings used for the conference
+experiments, including the ResNet and VGG training pipelines, the SNR sweep, and
+the cross-architecture generalisation experiment.
+
+The tracked `recipes/test_*.sh` scripts provide quick end-to-end checks of the
+same pipeline using a smaller model and dataset.
+
 ## Citation
 
 If you use this code in your work, please cite:
+
+```
+@misc{tarizzo2026learneddigitalaircomp,
+      title={Learned Digital Over-the-Air Computing for Federated Edge Learning},
+      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
+      year={2026},
+      note={SPAWC manuscript}
+}
+```
+
+For the extended arXiv version:
 
 ```
 @article{tarizzo2025learneddigitalotacomputation,
@@ -50,7 +70,6 @@ If you use this code in your work, please cite:
       note={Submitted to IEEE Journal on Selected Areas in Communications 2026}
 }
 ```
-
 Or for the earlier conference version:
 
 ```

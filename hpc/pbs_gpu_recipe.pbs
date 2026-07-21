@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N amp_da_net
+#PBS -l select=1:ncpus=4:ngpus=1:mem=32gb
+#PBS -l walltime=18:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+: "${PBS_O_WORKDIR:?PBS_O_WORKDIR is not set}"
+: "${RECIPE:?Submit with -v RECIPE=recipes/paper/<recipe>.sh}"
+: "${PYTHON_BIN:?Submit with -v PYTHON_BIN=/absolute/path/to/python}"
+
+cd "$PBS_O_WORKDIR"
+export PYTHON_BIN
+export MAX_HOURS="${MAX_HOURS:-17}"
+
+bash "$RECIPE"

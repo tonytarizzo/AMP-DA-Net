@@ -17,7 +17,7 @@ from src.models import _model_factory_from_args
 from src.federated import update_model_inplace
 from src.paths import make_raw_dataset_slug, _fmt_float
 from src.utils import EarlyStopNaN, _ensure_finite
-from src.analysis import plot_dataset_collection_history
+from src.analysis import plot_dataset_collection_history, run_manifest, save_json
 
 
 class TargetDatasetCollector:
@@ -71,6 +71,19 @@ class TargetDatasetCollector:
             "frac_random": float(args.frac_random),
             "seed": int(args.seed),
             "round_ids": self.round_ids,
+            "collection_config": {
+                "train_size": int(args.train_size),
+                "valid_size": int(args.valid_size),
+                "test_size": int(args.test_size),
+                "num_test_rounds": int(args.num_test_rounds),
+                "within_round": str(args.within_round),
+                "total_rounds": int(args.total_rounds),
+                "local_epochs": int(args.local_epochs),
+                "local_lr": float(args.local_lr),
+                "optimizer": str(args.optimizer),
+                "batch_size_train": int(args.batch_size_train),
+                "batch_size_test": int(args.batch_size_test),
+            },
         }
         self.row_dtype = None
         print(f"[dataset] Will save → {self.out_path}  | L={self.L}  | S(per-device)={self.S}")
@@ -197,6 +210,10 @@ class TargetDatasetCollector:
             if self.frag_remaining[k] > 0:
                 print(f"[warn] fragment quota for {k} underfilled by {self.frag_remaining[k]} fragments.")
 
+        self.meta["fragment_quota"] = dict(self.frag_quota)
+        self.meta["fragment_remaining"] = dict(self.frag_remaining)
+        self.meta["collection_complete"] = all(value <= 0 for value in self.frag_remaining.values())
+
         bundle = {
             "meta": self.meta,
             "D": self.D,
@@ -237,7 +254,7 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
     """
     # 0) Start timer and display setup info
     training_start = time.time()
-    max_duration = 23 * 3600
+    max_duration = float(args.max_hours) * 3600
 
     D = sum(p.numel() for p in global_model.parameters())
     args.model_num_params = int(D)
@@ -295,6 +312,8 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
             n_train = int(0.8 * n)
 
             train_global_idxs = device_full_indices[:n_train].tolist()
+            if args.max_local_samples > 0:
+                train_global_idxs = train_global_idxs[:args.max_local_samples]
             cifar_train_transform = datasets.CIFAR10(root=args.data_dir, train=True, download=False, transform=transform_train)
             train_subset = Subset(cifar_train_transform, train_global_idxs)
             train_loader = DataLoader(train_subset, batch_size=args.batch_size_train, shuffle=True, num_workers=2, pin_memory=True)
@@ -332,7 +351,8 @@ def federated_training(global_model, device_loaders, test_loader, args, device, 
         deltas = torch.stack(local_deltas, dim=0)  # Shape: (K_a, D)
         _ensure_finite(deltas, "deltas")
 
-        # 4f) Save per-device updates & local BS training to dataset collector
+        # 4f) Follow the AMP-DA convention: the first active device supplies
+        # the proxy update used to construct the BS-side quantiser.
         dataset_collector.add_bs_local(deltas[0], r1_based=rnd)
         dataset_collector.add_round_devices(deltas, K_a, r1_based=rnd)
 
@@ -414,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument('--total-rounds', type=int, default=5, help="total number of global rounds")
     parser.add_argument('--local-epochs', type=int, default=3, help="number of local epochs per round")
     parser.add_argument('--local-lr', type=float, default=0.01, help="local learning rate")
+    parser.add_argument('--max-local-samples', type=int, default=0, help="cap local samples per device for smoke tests (0 = all)")
     parser.add_argument('--message-split', type=int, default=10, help="message split size L (quantization dimension)")
     
     # === Global Optimizer Parameters ===
@@ -431,6 +452,7 @@ if __name__ == "__main__":
 
     # === System Parameters ===
     parser.add_argument('--save-dir', type=str, default="runs/results", help="directory to save results")
+    parser.add_argument('--max-hours', type=float, default=23.0, help="stop cleanly after this wall-clock duration")
     parser.add_argument('--seed', type=int, default=42, help="random seed")
     args = parser.parse_args()
 
@@ -473,4 +495,8 @@ if __name__ == "__main__":
         make_model=make_model
     )
     plot_dataset_collection_history(history, os.path.join(args.save_dir, "history_plots"))
+    save_json(
+        run_manifest(args, extra={"stage": "dataset_collection", "dataset_path": dataset_path, "history": history}),
+        os.path.join(args.save_dir, "summaries", "collection_manifest.json"),
+    )
     print(f"Dataset collection complete. Bundle saved to: {dataset_path}")

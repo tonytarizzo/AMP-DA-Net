@@ -1,11 +1,16 @@
 
 import os
+from numbers import Real
 import torch
 from ..models.factory import _model_tag_from_args
 
 
 def _fmt_float(f: float, ndigits=2):
-    return f"{f:.{ndigits}f}".rstrip('0').rstrip('.') if isinstance(f, float) else str(f)
+    """Format numbers compactly without stripping meaningful integer zeroes."""
+    if not isinstance(f, Real):
+        return str(f)
+    rendered = f"{float(f):.{ndigits}f}"
+    return rendered if ndigits <= 0 else rendered.rstrip('0').rstrip('.')
 
 def _norm_order_tag(order: str | None):
     if order is None or str(order).lower() in {"none", "null", "na"}:
@@ -103,9 +108,15 @@ def load_raw_ifed_bundle(args, device):
     model_tag = _model_tag_from_args(args)
     if meta.get("model") and str(meta["model"]) != model_tag:
         print(f"[warn] model tag differs: dataset={meta['model']} vs args={model_tag}")
-    for k in ["K_t", "min_p", "max_p"]:
-        if k in meta and int(meta[k]) != int(getattr(args, k.replace("_", "-").replace("K-t", "K_t"), meta[k])):
-            print(f"[warn] {k} differs: dataset={meta[k]} vs args={getattr(args, k.replace('_', '-').replace('K-t', 'K_t'), 'N/A')}")
+    collected_within_round = meta.get("collection_config", {}).get("within_round")
+    if collected_within_round and collected_within_round != getattr(args, "within_round", collected_within_round):
+        print(f"[warn] within_round differs: dataset={collected_within_round} vs args={args.within_round}")
+    for meta_key, arg_key in {"K_t": "K_t", "min_p": "min_p", "max_p": "max_p"}.items():
+        if meta_key not in meta or not hasattr(args, arg_key):
+            continue
+        requested = getattr(args, arg_key)
+        if int(meta[meta_key]) != int(requested):
+            print(f"[warn] {meta_key} differs: dataset={meta[meta_key]} vs args={requested}")
 
     print(f"[dataset] Loaded raw iFed bundle: {path}")
     return path, bundle

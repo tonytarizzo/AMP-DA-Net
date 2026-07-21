@@ -5,6 +5,9 @@ import csv
 import socket
 import platform
 import datetime
+from pathlib import Path
+import subprocess
+import sys
 import numpy as np
 import torch
 import time
@@ -46,7 +49,7 @@ def save_round_history_csv(history_dict, path):
     print(f"[save] {path}")
 
 def run_manifest(args, extra=None):
-    """Small metadata bundle to join results across runs."""
+    """Metadata bundle sufficient to inspect and re-run an experiment."""
     stamp = datetime.datetime.now().isoformat(timespec="seconds")
     sysinfo = dict(host=socket.gethostname(), os=platform.platform())
     base = dict(
@@ -70,7 +73,24 @@ def run_manifest(args, extra=None):
         save_dir=str(getattr(args,"save_dir","")),
         job=os.environ.get("PBS_JOBNAME") or os.environ.get("SLURM_JOB_NAME"),
         sys=sysinfo,
+        command=[sys.executable, *sys.argv],
+        arguments=dict(vars(args)),
     )
+    try:
+        repository_root = Path(__file__).resolve().parents[2]
+        git = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            check=True, timeout=2, cwd=repository_root,
+        )
+        base["git_commit"] = git.stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True,
+            check=True, timeout=2, cwd=repository_root,
+        )
+        base["git_dirty"] = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        base["git_commit"] = None
+        base["git_dirty"] = None
     if extra: base.update(extra)
     return base
 

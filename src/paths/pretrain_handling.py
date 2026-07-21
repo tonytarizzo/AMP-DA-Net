@@ -98,6 +98,19 @@ def save_pretrained_artifacts(model, args):
             "quant_type": str(getattr(args, "quant_type", "kmeans_plusplus")).lower(),
             "lambda_q": float(getattr(args, "lambda_q", 0.0)),
             "agg_method": str(getattr(args, "agg_method", "average")).lower(),
+            "training": {
+                "pt_epochs": int(args.pt_epochs),
+                "pt_batch_size": int(args.pt_batch_size),
+                "pt_patience": int(args.pt_patience),
+                "pt_delta": float(args.pt_delta),
+                "sched_patience": int(args.sched_patience),
+                "sched_factor": float(args.sched_factor),
+                "amp_lr": float(args.amp_lr),
+                "lambda_sparse": float(args.lambda_sparse),
+                "lambda_w": float(args.lambda_w),
+                "lambda_k": float(args.lambda_k),
+                "lambda_q": float(args.lambda_q),
+            },
         }
     }
 
@@ -184,6 +197,23 @@ def find_decoder_artifacts(args):
     cb  = base + "_cb.pt"
     if os.path.isfile(dec) and os.path.isfile(cb):
         return dec, cb
+
+    # Compatibility with checkpoints written before the integer SNR formatter
+    # was fixed (for example, 0--20 dB was incorrectly rendered as "[-2]").
+    if not args.decoder_slug and str(getattr(args, "snr_mode", "fixed")).lower() == "range":
+        old_min = f"{float(args.snr_min_db):.0f}".rstrip("0").rstrip(".")
+        old_max = f"{float(args.snr_max_db):.0f}".rstrip("0").rstrip(".")
+        current_tag = f"snrU[{_fmt_float(args.snr_min_db, 0)}-{_fmt_float(args.snr_max_db, 0)}]dB"
+        legacy_tag = f"snrU[{old_min}-{old_max}]dB"
+        legacy_base = os.path.join(args.ckpt_dir, slug.replace(current_tag, legacy_tag))
+        legacy_dec = legacy_base + ".pth"
+        legacy_cb = legacy_base + "_cb.pt"
+        if os.path.isfile(legacy_dec) and os.path.isfile(legacy_cb):
+            warnings.warn(
+                f"Loading legacy checkpoint slug '{os.path.basename(legacy_base)}'. "
+                "New runs use the corrected SNR range tag."
+            )
+            return legacy_dec, legacy_cb
 
     raise FileNotFoundError(
         f"Could not find decoder pair. Looked for:\n  {dec}\n  {cb}\n"

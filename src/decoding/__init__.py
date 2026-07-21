@@ -5,6 +5,7 @@ from .greedy import (
 )
 from .post_processing import (
     greedy_rounding,
+    paper_count_projection,
     l2_refit_on_support,
     top_k_nonneg,
 )

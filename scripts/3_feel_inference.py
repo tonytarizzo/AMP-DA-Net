@@ -29,6 +29,7 @@ from src.decoding import (
     AMPNet1DEnhanced,
     SimAMPNetLossWithSparsity,
     greedy_rounding, 
+    paper_count_projection,
     l2_refit_on_support, 
     top_k_nonneg,
 )
@@ -69,7 +70,11 @@ def corrupt_deltas(deltas: torch.Tensor, corruption_frac: float, seed: int = Non
         snr_lin = 10 ** (-6.0 / 10.0)  # -6 dB SNR
         P_signal = delta_1d.pow(2).mean()
         noise_std = (P_signal / snr_lin).sqrt()
-        deltas_out[idx] = delta_1d + torch.randn_like(delta_1d, generator=g) * noise_std
+        noise = torch.randn(
+            delta_1d.shape, dtype=delta_1d.dtype,
+            device=delta_1d.device, generator=g,
+        )
+        deltas_out[idx] = delta_1d + noise * noise_std
     
     return deltas_out
 
@@ -125,6 +130,7 @@ class WirelessCompressor(nn.Module):
         self.device = device
         self.grad_accumulation_size = int(args.grad_accumulation_size)
         self.post_rounding = bool(args.post_rounding)
+        self.post_processing = str(args.post_processing).lower()
         self.agg_method = str(getattr(args, 'agg_method', 'average')).lower()
         self.trim_frac = float(getattr(args, 'trim_frac', 0.1))
 
@@ -196,11 +202,16 @@ class WirelessCompressor(nn.Module):
         A_np = self.C_syn.t().detach().cpu().numpy()
         for i in range(S):
             xi = X_raw[i].detach().cpu().numpy()
-            xk = top_k_nonneg(xi, K_int)
-            if y is not None:
-                yi = y[i].detach().cpu().numpy()
-                xk = l2_refit_on_support(yi, A_np, xk, ridge=ridge, nonneg=True)
-            xk = greedy_rounding(xk, K_int)
+            if self.post_processing == "paper":
+                xk = paper_count_projection(xi, K_int)
+            elif self.post_processing == "advanced":
+                xk = top_k_nonneg(xi, K_int)
+                if y is not None:
+                    yi = y[i].detach().cpu().numpy()
+                    xk = l2_refit_on_support(yi, A_np, xk, ridge=ridge, nonneg=True)
+                xk = greedy_rounding(xk, K_int)
+            else:
+                raise ValueError(f"Unknown post-processing mode: {self.post_processing}")
             out.append(torch.tensor(xk, device=X_raw.device, dtype=X_raw.dtype))
         return torch.stack(out, dim=0)
 
@@ -291,7 +302,8 @@ class WirelessCompressor(nn.Module):
         K_a, D = deltas_w_feedback.shape
         S, L = args.num_splits, args.message_split
 
-        # 1) Update quantisation codebook & base station mini dataset
+        # 1) Follow the AMP-DA convention: the first active device supplies
+        # the proxy update used to construct the BS-side quantiser.
         bs_mini = deltas_w_feedback[0]
         pad = (-bs_mini.numel()) % L
         if pad > 0:
@@ -364,7 +376,7 @@ def federated_training(
     """
     # 0) Start timer, dispaly setup info & define transforms
     training_start = time.time()
-    max_duration = 23 * 3600
+    max_duration = float(args.max_hours) * 3600
 
     D = sum(p.numel() for p in global_model.parameters())
     args.num_splits = math.ceil(D / args.message_split)  # Number of message-splits per device
@@ -424,6 +436,8 @@ def federated_training(
             n_train = int(0.8 * n)
 
             train_global_idxs = device_full_indices[:n_train].tolist()
+            if args.max_local_samples > 0:
+                train_global_idxs = train_global_idxs[:args.max_local_samples]
             base_dataset = device_loaders[dev_id].dataset.dataset
             train_subset = Subset(base_dataset, train_global_idxs)
             train_loader = DataLoader(
@@ -576,6 +590,7 @@ if __name__ == "__main__":
     parser.add_argument('--local-epochs', type=int, default=3, help="number of local epochs per round")
     parser.add_argument('--local-batch-size', type=int, default=20, help="local training batch size")
     parser.add_argument('--local-lr', type=float, default=0.01, help="local learning rate")
+    parser.add_argument('--max-local-samples', type=int, default=0, help="cap local samples per device for smoke tests (0 = all)")
     
     # === Global Optimizer Parameters ===
     parser.add_argument('--optimizer', type=str, default='fedavg', choices=['fedavg', 'fedavgm', 'fedadam'], help="global optimizer type")
@@ -595,6 +610,7 @@ if __name__ == "__main__":
     parser.add_argument('--snr-max-db', type=float, default=20.0, help="for slug when --snr-mode=range")
 
     parser.add_argument("--post-rounding", action=argparse.BooleanOptionalAction, default=True, help="apply post-rounding")
+    parser.add_argument('--post-processing', type=str, default='paper', choices=['paper', 'advanced'], help="paper: clip + sum-K rounding; advanced: top-K + least-squares refit + rounding")
     parser.add_argument('--grad-accumulation-size', type=int, default=128, help="gradient accumulation size for decoding")
     parser.add_argument('--code-order', type=str, default="pop", choices=["none", "pop", "spectral", "spectral_pop"])
 
@@ -645,6 +661,7 @@ if __name__ == "__main__":
 
     # === System Parameters ===
     parser.add_argument('--early-stopping-patience', type=int, default=20)
+    parser.add_argument('--max-hours', type=float, default=23.0, help="stop cleanly after this wall-clock duration")
     parser.add_argument('--save-dir', type=str, default="runs/results")
     parser.add_argument('--seed', type=int, default=42)
 
@@ -703,6 +720,8 @@ if __name__ == "__main__":
         agg_method=str(getattr(args, 'agg_method', 'average')),
         corruption_frac=float(getattr(args, 'corruption_frac', 0.0)),
         use_error_feedback=bool(getattr(args, 'use_error_feedback', True)),
+        requested_snr_db=float(args.snr_db),
+        post_processing=str(args.post_processing),
         curv_mode=str(getattr(args, 'curv_mode', 'none')),
         kmeans_max_iter=int(getattr(args, 'kmeans_max_iter', 0)),
     )

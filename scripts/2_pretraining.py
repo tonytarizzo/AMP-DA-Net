@@ -115,6 +115,13 @@ def load_raw_splits(args, device):
     """Load the new raw iFed bundle and materialize per-split tensors."""
     bundle_path, bundle = load_raw_ifed_bundle(args, device=device)
     args.bundle_path = bundle_path
+    collection_complete = bundle.get("meta", {}).get("collection_complete")
+    if collection_complete is False and not args.allow_incomplete_dataset:
+        remaining = bundle.get("meta", {}).get("fragment_remaining", {})
+        raise ValueError(
+            f"Dataset collection is incomplete (remaining fragments: {remaining}). "
+            "Resume/re-run collection, or pass --allow-incomplete-dataset for a non-paper smoke run."
+        )
 
     K_rounds = bundle["K_rounds"].to(device=device)  # [R]
     splits = bundle["splits"]                        # {"train": {...}, "valid": {...}, "test": {...}}
@@ -282,8 +289,12 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
     # Codebook initialization options (all unit-norm rows)
     init_mode = str(getattr(args, "codebook_init", "gaussian")).lower()
     if init_mode == "q_init":
-        print("[warn] Due to quantisation now being part of scope, q_init initialisation not possible, defaulting to gaussian")
-        C_init = make_gaussian_codebook(args.n, args.dim, args.device)
+        raise NotImplementedError(
+            "q_init is not implemented for raw per-device bundles. Refusing to "
+            "label a Gaussian fallback as data-driven initialisation. Use "
+            "--codebook-init gaussian/bernoulli, or materialise the training "
+            "count vectors before computing q_init."
+        )
     elif init_mode == "gaussian":
         C_init = make_gaussian_codebook(args.n, args.dim, args.device)
     elif init_mode == "bernoulli":
@@ -499,9 +510,9 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
         lr_amp = sched_amp.optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{args.pt_epochs} AMP-train={train_losses[-1]:.6f} AMP-val={val_loss:.6f} LR_AMP={lr_amp:.6f}")
 
-        # Runtime check: if elapsed time >= 17 hours, stop training
+        # Runtime check: stop before the enclosing scheduler allocation expires.
         elapsed_hours = (time.time() - start_time) / 3600
-        if elapsed_hours >= 17:
+        if elapsed_hours >= args.max_hours:
             print(f"[early stop] Time limit reached after {elapsed_hours:.2f} hours, proceeding to evaluation")
             break
 
@@ -528,7 +539,7 @@ def pre_train_decoder(train_set, train_K, train_blocks, valid_set, valid_K, vali
 
     with torch.no_grad():
         amp = model.ampnet
-        print("\n=== Learned AMP-DM-Net parameters ===")
+        print("\n=== Learned AMP-DA-Net parameters ===")
         print(f"use_poisson={amp.use_poisson}  update_alpha={amp.update_alpha}  "
               f"learn_sigma2={amp.learn_sigma2}  "
               f"finetune_K={amp.finetune_K}  finetune_pi={amp.finetune_pi}  finetune_sigma2={amp.finetune_sigma2}  "
@@ -783,20 +794,21 @@ def compare_decoders(model, test_set, test_K, test_blocks, bundle, args, test_sn
                     except Exception as e:
                         print(f"Warning: Advanced post failed for sample {j}: {e}")
 
-                # 5) AMP-DM (uses sparse vectors with Bernoulli encoding)
-                try:
-                    Z_ampdm, A_ampdm = bernoulli_encode_with_noise(
-                        sparse_vecs.to(args.device), n=model.ampnet.n, d=model.ampnet.d, snr_db=snr_db_r,
-                        device=args.device, dtype=sparse_vecs.dtype
-                    )
-                    x_ampdm_b, stats = amp_da(Z_ampdm, A_ampdm, device=args.device)
-                    xa = x_ampdm_b.cpu().numpy(); xt = sparse_vecs.cpu().numpy()
-                    for j in range(xa.shape[0]):
-                        results['ampdm']['nmse'].append(compute_nmse(xt[j], xa[j]))
-                        results['ampdm']['acc'].append(compute_accuracy(xt[j], xa[j]))
-                        results['ampdm']['pupe'].append(compute_pupe(xt[j], xa[j]))
-                except Exception as e:
-                    print(f"Warning: AMP-DM baseline failed on round {ridx}: {e}")
+            # 5) AMP-DA baseline once per round. This used to be repeated for
+            # every AMP-DA-Net mini-batch, duplicating identical work/metrics.
+            try:
+                Z_ampdm, A_ampdm = bernoulli_encode_with_noise(
+                    sparse_vecs.to(args.device), n=model.ampnet.n, d=model.ampnet.d, snr_db=snr_db_r,
+                    device=args.device, dtype=sparse_vecs.dtype
+                )
+                x_ampdm_b, stats = amp_da(Z_ampdm, A_ampdm, device=args.device)
+                xa = x_ampdm_b.cpu().numpy(); xt = sparse_vecs.cpu().numpy()
+                for j in range(xa.shape[0]):
+                    results['ampdm']['nmse'].append(compute_nmse(xt[j], xa[j]))
+                    results['ampdm']['acc'].append(compute_accuracy(xt[j], xa[j]))
+                    results['ampdm']['pupe'].append(compute_pupe(xt[j], xa[j]))
+            except Exception as e:
+                print(f"Warning: AMP-DA baseline failed on round {ridx}: {e}")
 
     print("\n" + "="*75)
     print(f"{'Method':<25}{'NMSE':<20}{'Accuracy':<20}{'PUPE':<20}")
@@ -806,7 +818,7 @@ def compare_decoders(model, test_set, test_K, test_blocks, bundle, args, test_sn
         'ampnet': 'Joint AMPNet',
         'ista': 'Basic ISTA',
         'post_basic': 'AMPNet + Basic Post',
-        'ampdm': 'AMP-DM (Bernoulli A)',
+        'ampdm': 'AMP-DA (Bernoulli A)',
         'ampnet_v2': 'AMPNet + Adv Post',
     }
     for key, label in names.items():
@@ -893,6 +905,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset-dir', type=str, default="runs/datasets/iFed_datasets", help="Directory containing iFed .pth bundles")
     parser.add_argument('--dataset-path', type=str, default="", help="Exact path to a .pth dataset (overrides slug)")
     parser.add_argument('--dataset-slug', type=str, default="", help="Optional slug override (fuzzy match allowed)")
+    parser.add_argument('--allow-incomplete-dataset', action=argparse.BooleanOptionalAction, default=False, help="allow a time-limited, underfilled bundle (not recommended for paper runs)")
     parser.add_argument('--code-order', type=str, default="pop", choices=["none", "spectral", "spectral_pop", "pop"], help="Codebook ordering strategy")
     parser.add_argument('--model', type=str, default='resnet', choices=['resnet', 'cifarcnn', 'smallvgg', 'custom'], help="Model tag used during collection (affects slug)")
     parser.add_argument('--custom-model', type=str, default='', help="For --model custom: 'module.path:ClassName'")
@@ -948,6 +961,7 @@ if __name__ == "__main__":
     # === Training Control & System ===
     parser.add_argument('--ckpt-dir', type=str, default="runs/checkpoints/pretrain", help="directory to save pretrained decoder & codebook")
     parser.add_argument('--save-dir', type=str, default="runs/results/pretrain", help="directory to save results")
+    parser.add_argument('--max-hours', type=float, default=17.0, help="stop cleanly after this wall-clock duration")
     parser.add_argument('--seed', type=int, default=42, help="random seed")
 
     args = parser.parse_args()

@@ -1,6 +1,8 @@
-# run_pretrain.sh
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_common.sh"
 
-python -u -m scripts.2_pretraining \
+"$PYTHON_BIN" -u -m scripts.2_pretraining \
   --pt-epochs             500 \
   --pt-batch-size         64 \
   --pt-patience           50 \

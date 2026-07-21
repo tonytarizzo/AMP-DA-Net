@@ -166,7 +166,7 @@ def plot_inference_history(history, save_dir, snr_true_db: float):
 
     plt.figure(figsize=(10,6))
     plt.plot(rounds, history['ampnet_acc'], marker='o')
-    plt.xlabel('Global Round'); plt.ylabel('AMP-DM-Net Accuracy'); plt.ylim(0.0,1.0); plt.grid(True, ls='--', alpha=0.5)
+    plt.xlabel('Global Round'); plt.ylabel('AMP-DA-Net Accuracy'); plt.ylim(0.0,1.0); plt.grid(True, ls='--', alpha=0.5)
     _save(plt, 'ampnet_accuracy.png')
 
     plt.figure(figsize=(10,6))
