@@ -36,7 +36,7 @@ source "$(dirname "$0")/_common.sh"
   --code-order            pop \
   \
   --agg-method            average \
-  --trim-frac             0.1 \
+  --trim-threshold        0.8 \
   --corruption-frac       0.0 \
   --use-error-feedback \
   \

@@ -12,6 +12,7 @@ from src.paths import _fmt_float, load_raw_ifed_bundle
 from src.paths.pretrain_handling import find_decoder_artifacts
 
 corrupt_deltas = importlib.import_module("scripts.3_feel_inference").corrupt_deltas
+aggregate_sparse_vectors = importlib.import_module("scripts.3_feel_inference").aggregate_sparse_vectors
 pretraining_module = importlib.import_module("scripts.2_pretraining")
 load_raw_splits = pretraining_module.load_raw_splits
 
@@ -83,6 +84,35 @@ class CorruptionSmokeTests(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
         self.assertTrue(torch.equal(first[0], deltas[0]))
         self.assertFalse(torch.equal(first, deltas))
+
+
+class AggregationRuleTests(unittest.TestCase):
+    def test_arithmetic_mean_uses_estimated_active_count(self):
+        import torch
+
+        counts = torch.tensor([[2.0, 1.0, 1.0]])
+        weights = aggregate_sparse_vectors(counts, active_count=4)
+        self.assertTrue(torch.equal(weights, torch.tensor([[0.5, 0.25, 0.25]])))
+
+    def test_majority_voting_averages_tied_centroids(self):
+        import torch
+
+        counts = torch.tensor([[3.0, 3.0, 1.0]])
+        weights = aggregate_sparse_vectors(counts, method="majority_voting", active_count=7)
+        self.assertTrue(torch.equal(weights, torch.tensor([[0.5, 0.5, 0.0]])))
+
+    def test_trimmed_mean_splits_cutoff_mass_across_ties(self):
+        import torch
+
+        counts = torch.tensor([[5.0, 3.0, 3.0, 3.0]])
+        weights = aggregate_sparse_vectors(
+            counts,
+            method="trimmed_mean",
+            trim_threshold=0.8,
+            active_count=12,
+        )
+        expected = torch.tensor([[0.5, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0]])
+        self.assertTrue(torch.allclose(weights, expected))
 
 
 class IncompleteDatasetTests(unittest.TestCase):

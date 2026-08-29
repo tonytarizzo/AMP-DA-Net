@@ -79,44 +79,68 @@ def corrupt_deltas(deltas: torch.Tensor, corruption_frac: float, seed: int = Non
     return deltas_out
 
 
-def aggregate_sparse_vectors(target_vectors: torch.Tensor, method: str = "average", 
-                             trim_frac: float = 0.1) -> torch.Tensor:
-    """Aggregate sparse vectors from all splits using specified method."""
+def aggregate_sparse_vectors(target_vectors: torch.Tensor, method: str = "average",
+                             trim_threshold: float = 0.8,
+                             active_count: int = None) -> torch.Tensor:
+    """Return codeword weights for the selected aggregation rule."""
+    counts = target_vectors.float()
+    if counts.ndim != 2:
+        raise ValueError("target_vectors must have shape (num_splits, num_codewords)")
+
     if method == "average":
-        # Default average across all counts
-        return target_vectors.float()
+        if active_count is None:
+            denominator = counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+        else:
+            denominator = max(1, int(active_count))
+        return counts / denominator
     
     elif method == "majority_voting":
-        # Majority voting: keep only the most common codeword per split
-        S, n = target_vectors.shape
-        result = torch.zeros_like(target_vectors, dtype=torch.float32)
+        # Average all centroids tied for the largest recovered count.
+        result = torch.zeros_like(counts)
         
-        for s in range(S):
-            # Find which codewords were selected
-            counts = target_vectors[s]  # (n,)
-            if counts.sum() > 0:
-                # Keep only the most common codeword
-                max_idx = torch.argmax(counts)
-                result[s, max_idx] = counts[max_idx].float()
+        for s in range(counts.shape[0]):
+            magnitudes = counts[s].abs()
+            max_value = magnitudes.max()
+            if max_value > 0:
+                tied = magnitudes == max_value
+                result[s, tied] = 1.0 / tied.sum()
         return result
     
     elif method == "trimmed_mean":
-        # Trimmed mean: for each codeword, trim extreme counts
-        S, n = target_vectors.shape
-        result = torch.zeros_like(target_vectors, dtype=torch.float32)
+        if not 0.0 < trim_threshold <= 1.0:
+            raise ValueError("trim_threshold must lie in (0, 1]")
+
+        # Retain the largest recovered counts up to ceil(tau * K_hat).
+        result = torch.zeros_like(counts)
         
-        for j in range(n):
-            col = target_vectors[:, j].float()  # (S,)
-            # Only consider non-zero entries for trimming
-            nonzero_mask = col > 0
-            if nonzero_mask.sum() >= 3:
-                values = col[nonzero_mask]
-                k_trim = max(1, int(len(values) * trim_frac))
-                sorted_vals, _ = torch.sort(values)
-                trimmed = sorted_vals[k_trim:-k_trim] if len(sorted_vals) > 2*k_trim else sorted_vals
-                result[nonzero_mask, j] = trimmed.mean() if len(trimmed) > 0 else values.mean()
-            else:
-                result[:, j] = col
+        for s in range(counts.shape[0]):
+            magnitudes = counts[s].abs()
+            estimated_count = int(active_count) if active_count is not None else int(round(magnitudes.sum().item()))
+            target_mass = max(1, int(math.ceil(trim_threshold * estimated_count)))
+            sorted_values, sorted_indices = torch.sort(magnitudes, descending=True)
+            cumulative = 0.0
+            i = 0
+
+            while cumulative < target_mass and i < sorted_values.numel():
+                current = float(sorted_values[i].item())
+                if current == 0.0:
+                    break
+
+                j = i + 1
+                while j < sorted_values.numel() and float(sorted_values[j].item()) == current:
+                    j += 1
+
+                tied_indices = sorted_indices[i:j]
+                remaining = target_mass - cumulative
+                tied_mass = current * tied_indices.numel()
+                weight = current if tied_mass <= remaining else remaining / tied_indices.numel()
+                result[s, tied_indices] = weight
+                cumulative += min(tied_mass, remaining)
+                i = j
+
+            total_weight = result[s].sum()
+            if total_weight > 0:
+                result[s] /= total_weight
         return result
     
     else:
@@ -132,7 +156,7 @@ class WirelessCompressor(nn.Module):
         self.post_rounding = bool(args.post_rounding)
         self.post_processing = str(args.post_processing).lower()
         self.agg_method = str(getattr(args, 'agg_method', 'average')).lower()
-        self.trim_frac = float(getattr(args, 'trim_frac', 0.1))
+        self.trim_threshold = float(getattr(args, 'trim_threshold', getattr(args, 'trim_frac', 0.8)))
 
         # 1) Load pretrained AMPNet & URA codebook
         amp_state, meta, C_nt, dec_pth, cb_pt = load_pretrained_pair(args, device)
@@ -265,7 +289,12 @@ class WirelessCompressor(nn.Module):
             X_post = X_raw
 
         # 3) Apply aggregation method before reconstruction
-        X_agg = aggregate_sparse_vectors(X_post, method=self.agg_method, trim_frac=self.trim_frac)
+        X_agg = aggregate_sparse_vectors(
+            X_post,
+            method=self.agg_method,
+            trim_threshold=self.trim_threshold,
+            active_count=K_int_final,
+        )
 
         # 4) Reconstruct aggregated update (still padded)
         recovered_flat = (X_agg.float() @ self.Q_codebook).reshape(-1)
@@ -512,13 +541,13 @@ def federated_training(
             for i, dev_id in enumerate(participants): 
                 Q_errors[dev_id] = new_errors[i].detach()
 
-        # 4i) Build averaged delta list
+        # 4i) Build the already-aggregated delta list
         avg_delta = []
         pointer = 0
         for p in par_before:
             n_param = p.numel()
             slice_ = recovered_update[pointer:pointer+n_param].view(p.size())
-            avg_delta.append((slice_ / max(1, K_int)).detach())
+            avg_delta.append(slice_.detach())
             pointer += n_param
         assert pointer == recovered_update.numel(), "Mismatch in recovered update size!"
 
@@ -616,7 +645,7 @@ if __name__ == "__main__":
 
     # === Aggregation & Robustness Parameters ===
     parser.add_argument('--agg-method', type=str, default='average', choices=['average', 'majority_voting', 'trimmed_mean'], help="Aggregation method for sparse vectors")
-    parser.add_argument('--trim-frac', type=float, default=0.1, help="Fraction to trim on each side for trimmed_mean")
+    parser.add_argument('--trim-threshold', '--trim-frac', dest='trim_threshold', type=float, default=0.8, help="Recovered device-mass fraction retained by trimmed_mean")
     parser.add_argument('--corruption-frac', type=float, default=0.0, help="Fraction of devices to corrupt (Byzantine simulation)")
     parser.add_argument('--use-error-feedback', action=argparse.BooleanOptionalAction, default=True, help="Enable error feedback accumulation")
 
