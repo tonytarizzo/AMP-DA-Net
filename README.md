@@ -43,44 +43,53 @@ the cross-architecture generalisation experiment.
 The tracked `recipes/test_*.sh` scripts provide quick end-to-end checks of the
 same pipeline using a smaller model and dataset.
 
+
 ## Citation
 
-If you use this code in your work, please cite:
+If you use AMP-DA-Net or build upon this work, please cite the relevant paper below.
 
-```
-@misc{tarizzo2026learneddigitalaircomp,
-      title={Learned Digital Over-the-Air Computing for Federated Edge Learning},
-      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
-      year={2026},
-      note={SPAWC manuscript}
+### Conference Paper — IEEE SPAWC 2026
+
+**Learned Digital Over-the-Air Computing for Federated Edge Learning**
+
+Antonio Tarizzo, Mohammad Kazemi, and Deniz Gündüz.
+
+Presented at the *2026 IEEE International Workshop on Signal Processing and Artificial Intelligence for Wireless Communications (SPAWC)*.
+
+[Paper (arXiv)](https://arxiv.org/abs/2509.16577)
+
+```bibtex
+@inproceedings{tarizzo2026learneddigital,
+  title={Learned Digital Over-the-Air Computing for Federated Edge Learning},
+  author={Tarizzo, Antonio and Kazemi, Mohammad and G{\"u}nd{\"u}z, Deniz},
+  booktitle={2026 IEEE International Workshop on Signal Processing and Artificial Intelligence for Wireless Communications (SPAWC)},
+  year={2026},
+  eprint={2509.16577},
+  archivePrefix={arXiv},
+  url={https://arxiv.org/abs/2509.16577}
 }
 ```
 
-For the extended arXiv version:
+### Extended Paper — arXiv 2025
 
-```
-@article{tarizzo2025learneddigitalotacomputation,
-      title={Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning},
-      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
-      year={2025},
-      archivePrefix={arXiv},
-      eprint={2512.19777},
-      doi={10.48550/arXiv.2512.19777},
-      url={https://arxiv.org/abs/2512.19777},
-      note={Submitted to IEEE Journal on Selected Areas in Communications 2026}
+**Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning**
+
+Antonio Tarizzo, Mohammad Kazemi, and Deniz Gündüz.
+
+Extended manuscript, arXiv:2512.19777, 2025.
+
+[Paper (arXiv)](https://arxiv.org/abs/2512.19777)
+
+```bibtex
+@misc{tarizzo2025learneddigitalcodes,
+  title={Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning},
+  author={Tarizzo, Antonio and Kazemi, Mohammad and G{\"u}nd{\"u}z, Deniz},
+  year={2025},
+  eprint={2512.19777},
+  archivePrefix={arXiv},
+  primaryClass={cs.IT},
+  doi={10.48550/arXiv.2512.19777},
+  url={https://arxiv.org/abs/2512.19777}
 }
 ```
-Or for the earlier conference version:
 
-```
-@article{tarizzo2025learneddigitalcodesovertheair,
-      title={Learned Digital Codes for Over-the-Air Federated Learning}, 
-      author={Antonio Tarizzo and Mohammad Kazemi and Deniz Gündüz},
-      year={2025},
-      eprint={2509.16577},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2509.16577},
-      note={Initial version first submitted to ICASSP 2026; revised conference version submitted to SPAWC 2026}
-}
-```
