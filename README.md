@@ -52,8 +52,6 @@ If you use AMP-DA-Net or build upon this work, please cite the relevant paper be
 
 **Learned Digital Over-the-Air Computing for Federated Edge Learning**
 
-Antonio Tarizzo, Mohammad Kazemi, and Deniz Gündüz.
-
 Presented at the *2026 IEEE International Workshop on Signal Processing and Artificial Intelligence for Wireless Communications (SPAWC)*.
 
 [Paper (arXiv)](https://arxiv.org/abs/2509.16577)
@@ -73,8 +71,6 @@ Presented at the *2026 IEEE International Workshop on Signal Processing and Arti
 ### Extended Paper — arXiv 2025
 
 **Learned Digital Codes for Over-the-Air Computation in Federated Edge Learning**
-
-Antonio Tarizzo, Mohammad Kazemi, and Deniz Gündüz.
 
 Extended manuscript, arXiv:2512.19777, 2025.
 
